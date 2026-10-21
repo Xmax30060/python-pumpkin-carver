@@ -20,6 +20,7 @@ import bisect
 import csv
 import hashlib
 import html
+import importlib
 import json
 import multiprocessing as mp
 import os
@@ -37,8 +38,10 @@ import traceback
 from typing import Callable, cast
 
 try:
-    import hyperscan as _hyperscan  # Facultatif : accélération multi-signatures native
-except ImportError:
+    # Chargement dynamique : Hyperscan reste facultatif et Pylance ne signale pas
+    # un import manquant lorsque le paquet n’est pas installé dans cet environnement.
+    _hyperscan = importlib.import_module("hyperscan")
+except (ImportError, OSError):
     _hyperscan = None
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -484,7 +487,8 @@ _HS_CACHE_META = None
 def _hyperscan_matcher(signatures):
     """Compile une base Hyperscan une fois par processus et par ensemble de signatures."""
     global _HS_CACHE_KEY, _HS_CACHE_DB, _HS_CACHE_META, _hyperscan
-    if _hyperscan is None:
+    module = _hyperscan
+    if module is None:
         return None
     key = tuple(signatures)
     if _HS_CACHE_KEY != key:
@@ -495,13 +499,15 @@ def _hyperscan_matcher(signatures):
             expressions.append((ident, re.escape(sig), 0))
             meta[ident] = (ext, sig, lead)
         try:
-            db = _hyperscan.Database(mode=_hyperscan.HS_MODE_BLOCK)
+            db = module.Database(mode=module.HS_MODE_BLOCK)
             db.compile(expressions=expressions)
         except Exception:
             # Une version native incompatible ne doit jamais empêcher une récupération.
             _hyperscan = None
             return None
         _HS_CACHE_KEY, _HS_CACHE_DB, _HS_CACHE_META = key, db, meta
+    if _HS_CACHE_DB is None or _HS_CACHE_META is None:
+        return None
     return _HS_CACHE_DB, _HS_CACHE_META
 
 
@@ -514,7 +520,7 @@ def _scan_range(job):
         data = f.read(read_size)
     found = []
     matcher = _hyperscan_matcher(signatures)
-    if matcher:
+    if matcher is not None:
         db, meta = matcher
         def on_match(ident, from_, to, flags, context):
             ext, sig, lead = meta[ident]
@@ -526,7 +532,7 @@ def _scan_range(job):
         except Exception:
             found.clear()
             matcher = None
-    if not matcher:
+    if matcher is None:
         # Repli sans dépendance externe. Une lecture du bloc, puis recherche par signature.
         for ext, sig, lead in signatures:
             i = data.find(sig)
@@ -763,6 +769,141 @@ def _measure(f, off, ext, size, next_same, eng):
 # --------------------------------------------------------------------------- #
 # Plages occupées, validation, réparation, vidéo
 # --------------------------------------------------------------------------- #
+
+
+def _base_record(folder: str, name: str, ext: str, off: int, length: int,
+                 digest: str, note: str) -> dict:
+    """Construit une entrée de manifeste avec tous les champs attendus par les rapports."""
+    return {
+        "folder": folder,
+        "file": name,
+        "type": ext,
+        "offset_hex": hex(off),
+        "offset_decimal": off,
+        "size_bytes": length,
+        "sha256": digest,
+        "note": note,
+        "validation": "not_checked",
+        "width": None,
+        "height": None,
+        "saved": True,
+        "excluded_reason": "",
+        "repair_file": "",
+        "error": "",
+        "video_analysis": "",
+        "duration_sec": None,
+        "bitrate_kbps": None,
+        "anomaly": False,
+        "anomaly_reason": "",
+        "corrected_file": "",
+        "corrected_sha256": "",
+    }
+
+
+def _image_checks(record: dict, target: Path, out_dir: Path, opts: dict) -> None:
+    """Valide les images si Pillow est disponible, sans rendre Pillow obligatoire."""
+    try:
+        from PIL import Image, ImageFile
+    except ImportError:
+        record["validation"] = "not_checked"
+        record["error"] = "Pillow absent : validation d’image non effectuée."
+        return
+
+    try:
+        # Vérification stricte d’abord : une image tronquée ne doit pas être annoncée
+        # comme pleinement valide simplement parce qu’une miniature peut s’ouvrir.
+        ImageFile.LOAD_TRUNCATED_IMAGES = False
+        with Image.open(target) as im:
+            im.verify()
+        with Image.open(target) as im:
+            record["width"], record["height"] = im.size
+            im.load()
+        record["validation"] = "valid"
+    except Exception as exc:
+        record["validation"] = "invalid"
+        record["error"] = f"Validation image : {type(exc).__name__}: {exc}"[:500]
+        record["anomaly"] = True
+        record["anomaly_reason"] = "Image illisible ou potentiellement tronquée"
+
+
+def _probe_video(target: Path) -> dict | None:
+    """Retourne les métadonnées ffprobe, ou None si l’outil n’est pas disponible."""
+    exe = shutil.which("ffprobe")
+    if not exe:
+        return None
+    try:
+        result = subprocess.run(
+            [exe, "-v", "error", "-show_entries",
+             "format=duration,bit_rate:stream=codec_type,width,height,duration,bit_rate",
+             "-of", "json", str(target)],
+            capture_output=True, text=True, timeout=30, check=False,
+            **_hidden(),
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+        return data if isinstance(data, dict) else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _analyze_video(target: Path, length: int) -> dict:
+    """Analyse prudente des métadonnées vidéo ; n’infère pas de défaut sans preuve."""
+    data = _probe_video(target)
+    if data is None:
+        return {"video_analysis": "non disponible (ffprobe absent ou fichier non reconnu)",
+                "duration_sec": None, "bitrate_kbps": None,
+                "anomaly": False, "anomaly_reason": ""}
+    fmt = data.get("format") or {}
+    streams = data.get("streams") or []
+    duration = fmt.get("duration")
+    bitrate = fmt.get("bit_rate")
+    if duration is None:
+        durations = [x.get("duration") for x in streams if x.get("duration") is not None]
+        duration = durations[0] if durations else None
+    if bitrate is None:
+        rates = [x.get("bit_rate") for x in streams if x.get("bit_rate") is not None]
+        bitrate = rates[0] if rates else None
+    try:
+        duration = round(float(duration), 3) if duration is not None else None
+    except (TypeError, ValueError):
+        duration = None
+    try:
+        bitrate = round(float(bitrate) / 1000, 1) if bitrate is not None else None
+    except (TypeError, ValueError):
+        bitrate = None
+    recognized = bool(streams)
+    return {
+        "video_analysis": "métadonnées lues" if recognized else "aucun flux reconnu",
+        "duration_sec": duration,
+        "bitrate_kbps": bitrate,
+        "anomaly": not recognized,
+        "anomaly_reason": "ffprobe ne reconnaît aucun flux" if not recognized else "",
+    }
+
+
+def _correct_video(target: Path, output_dir: Path) -> Path | None:
+    """Tente un remux sans ré-encodage ; ne remplace jamais le fichier original."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    fixed = output_dir / f"{target.stem}_remux{target.suffix}"
+    temp = fixed.with_name(fixed.stem + ".part" + fixed.suffix)
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(target),
+             "-map", "0", "-c", "copy", "-movflags", "+faststart", str(temp)],
+            capture_output=True, text=True, timeout=1800, check=False,
+            **_hidden(),
+        )
+        if result.returncode != 0 or not temp.is_file() or temp.stat().st_size == 0:
+            temp.unlink(missing_ok=True)
+            return None
+        os.replace(temp, fixed)
+        return fixed
+    except (OSError, subprocess.SubprocessError):
+        temp.unlink(missing_ok=True)
+        return None
 
 def _range_overlap(starts, ends, a, b) -> bool:
     i = bisect.bisect_right(starts, a)
