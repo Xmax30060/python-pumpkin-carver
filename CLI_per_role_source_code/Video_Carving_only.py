@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import argparse
-import bisect
 import csv
 import hashlib
 import html
@@ -24,14 +23,16 @@ import os
 import subprocess
 import struct
 import sys
-import time
-import traceback
-import tempfile
 import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Optional
+
+try:
+    from PIL import Image
+except ImportError:  # Pillow is optional for image validation.
+    Image = None
+from typing import Optional
 
 # --------------------------------------------------------------------------- #
 # Constantes
@@ -85,7 +86,9 @@ class RecupError(Exception):
 # Scan des signatures (multi-processus)
 # --------------------------------------------------------------------------- #
 
+# pylint: disable=too-many-locals,too-many-nested-blocks
 def scan_range(job: tuple[str, int, int, int]) -> list[tuple[int, str]]:
+    """Scan one image range for known file signatures."""
     path, start, stop, chunk_size = job
     found: list[tuple[int, str]] = []
     try:
@@ -133,10 +136,14 @@ def scan_range(job: tuple[str, int, int, int]) -> list[tuple[int, str]]:
 def scan_signatures(
     path: Path, workers: int, chunk_size: int, progress_cb=None
 ) -> tuple[list[tuple[int, str]], int]:
+    """Scan an image in parallel and return unique signature offsets and size."""
     size = path.stat().st_size
     if size == 0:
         return [], 0
-    jobs = [(str(path), s, min(size, s + chunk_size), chunk_size) for s in range(0, size, chunk_size)]
+    jobs = [
+        (str(path), start, min(size, start + chunk_size), chunk_size)
+        for start in range(0, size, chunk_size)
+    ]
     found: list[tuple[int, str]] = []
     done = 0
     total = len(jobs)
@@ -162,6 +169,7 @@ def scan_signatures(
 # --------------------------------------------------------------------------- #
 
 def find_marker(f, offset: int, limit: int, marker: bytes, start_after: int = 0) -> Optional[int]:
+    """Find a byte marker in a bounded region and return its relative end offset."""
     f.seek(offset + start_after)
     cursor = offset + start_after
     carry = b""
@@ -179,6 +187,7 @@ def find_marker(f, offset: int, limit: int, marker: bytes, start_after: int = 0)
 
 
 def png_length(f, offset: int, image_size: int) -> Optional[int]:
+    """Determine a PNG file length by parsing chunks through IEND."""
     f.seek(offset)
     if f.read(8) != b"\x89PNG\r\n\x1a\n":
         return None
@@ -200,6 +209,7 @@ def png_length(f, offset: int, image_size: int) -> Optional[int]:
 
 
 def gif_length(f, offset: int, image_size: int) -> Optional[int]:
+    """Determine a GIF file length by locating its trailer marker."""
     f.seek(offset)
     if f.read(6) not in (b"GIF87a", b"GIF89a"):
         return None
@@ -208,6 +218,7 @@ def gif_length(f, offset: int, image_size: int) -> Optional[int]:
 
 
 def bmp_length(f, offset: int, image_size: int) -> Optional[int]:
+    """Read the declared BMP length and validate it against bounds."""
     f.seek(offset)
     h = f.read(54)
     if len(h) < 26 or h[:2] != b"BM":
@@ -217,6 +228,7 @@ def bmp_length(f, offset: int, image_size: int) -> Optional[int]:
 
 
 def pdf_length(f, offset: int, image_size: int) -> Optional[int]:
+    """Determine a PDF length from its last EOF marker within the size limit."""
     limit = min(image_size, offset + MAX_SIZES["pdf"])
     f.seek(offset)
     if f.read(5) != b"%PDF-":
@@ -243,7 +255,11 @@ def pdf_length(f, offset: int, image_size: int) -> Optional[int]:
     return last
 
 
-def video_length(f, offset: int, image_size: int, ext: str, next_offset: Optional[int] = None) -> int:
+def video_length(
+    _f, offset: int, image_size: int, ext: str,
+    next_offset: Optional[int] = None,
+) -> int:
+    """Estimate a video extent using the next signature and format limit."""
     max_limit = MAX_SIZES.get(ext, 100 * MIB)
     available = image_size - offset
     if next_offset is not None and next_offset > offset:
@@ -258,23 +274,41 @@ def video_length(f, offset: int, image_size: int, ext: str, next_offset: Optiona
 # --------------------------------------------------------------------------- #
 
 def image_validate(path: Path, ext: str) -> dict:
+    """Validate a recovered image and return its basic metadata."""
     if ext in ("mp4", "mkv", "mov", "avi"):
-        return {"validation": "not_applicable", "width": None, "height": None, "exif_date": None, "error": None}
-    try:
-        from PIL import Image
-    except ImportError:
-        return {"validation": "pillow_missing", "width": None, "height": None, "exif_date": None, "error": "Pillow absent"}
+        return {
+            "validation": "not_applicable", "width": None, "height": None,
+            "exif_date": None, "error": None,
+        }
+    if Image is None:
+        return {
+            "validation": "pillow_missing",
+            "width": None,
+            "height": None,
+            "exif_date": None,
+            "error": "Pillow absent",
+        }
     try:
         with Image.open(path) as im:
             fmt = im.format
             width, height = im.size
             im.verify()
-        return {"validation": "valid", "width": width, "height": height, "format": fmt, "exif_date": None, "error": None}
-    except Exception as e:
-        return {"validation": "invalid", "width": None, "height": None, "exif_date": None, "error": str(e)[:300]}
+        return {
+            "validation": "valid", "width": width, "height": height,
+            "format": fmt, "exif_date": None, "error": None,
+        }
+    except (OSError, ValueError, SyntaxError) as exc:
+        return {
+            "validation": "invalid",
+            "width": None,
+            "height": None,
+            "exif_date": None,
+            "error": str(exc)[:300],
+        }
 
 
 def analyze_large_video(path: Path, size_bytes: int) -> dict:
+    """Use ffprobe to inspect large videos and flag likely anomalies."""
     result = {
         "video_analysis": "not_checked",
         "duration_sec": None,
@@ -300,7 +334,7 @@ def analyze_large_video(path: Path, size_bytes: int) -> dict:
             "-show_streams",
             str(path)
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
         if proc.returncode != 0:
             result["video_analysis"] = "corrupt_or_invalid_container"
             result["anomaly"] = True
@@ -310,7 +344,7 @@ def analyze_large_video(path: Path, size_bytes: int) -> dict:
         data = json.loads(proc.stdout)
         fmt_info = data.get("format", {})
         duration = float(fmt_info.get("duration", 0))
-        
+
         if duration > 0:
             calculated_bitrate = (size_bytes * 8) / duration / 1000
             result["bitrate_kbps"] = int(calculated_bitrate)
@@ -321,22 +355,28 @@ def analyze_large_video(path: Path, size_bytes: int) -> dict:
                 result["anomaly"] = True
                 result["anomaly_reason"] = (
                     f"Débit excessif ({int(calculated_bitrate)} kbps) "
-                    f"pour une courte durée ({duration:.2f}s) et une taille de {size_bytes / MIB:.2f} Mo."
+                    f"pour une courte durée ({duration:.2f}s) et une taille de "
+                    f"{size_bytes / MIB:.2f} Mo."
                 )
         else:
             result["anomaly"] = True
             result["anomaly_reason"] = "Durée nulle ou illisible."
 
-    except Exception as e:
+    except (
+        OSError, ValueError, TypeError, json.JSONDecodeError,
+        subprocess.SubprocessError,
+    ) as exc:
         result["video_analysis"] = "analysis_failed"
         result["anomaly"] = True
-        result["anomaly_reason"] = str(e)[:200]
+        result["anomaly_reason"] = str(exc)[:200]
 
     return result
 
 
-def correct_video_with_ffmpeg(input_path: Path, output_dir: Path, ext: str) -> Optional[tuple[Path, str]]:
-    """Corrige et nettoie une vidéo anormale et l'enregistre directement dans le dossier principal."""
+def correct_video_with_ffmpeg(
+    input_path: Path, output_dir: Path, ext: str,
+) -> Optional[tuple[Path, str]]:
+    """Corrige une vidéo anormale et enregistre le résultat dans le dossier principal."""
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
         log.warning("FFmpeg introuvable : impossible d'effectuer la correction automatique.")
@@ -354,8 +394,8 @@ def correct_video_with_ffmpeg(input_path: Path, output_dir: Path, ext: str) -> O
             "-c:a", "libvo_aacenc",
             str(corrected_path)
         ]
-        
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
         if proc.returncode == 0 and corrected_path.exists() and corrected_path.stat().st_size > 0:
             h = hashlib.sha256()
             with open(corrected_path, "rb", buffering=0) as f:
@@ -365,14 +405,19 @@ def correct_video_with_ffmpeg(input_path: Path, output_dir: Path, ext: str) -> O
                         break
                     h.update(block)
             return corrected_path, h.hexdigest()
-    except Exception as e:
-        log.warning("Échec de la correction FFmpeg pour %s : %s", input_path.name, e)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning(
+            "Échec de la correction FFmpeg pour %s : %s",
+            input_path.name,
+            exc,
+        )
 
     return None
 
 
 @dataclass
 class RunStats:
+    """Counters and per-format totals for a carving run."""
     extracted: int = 0
     rejected: int = 0
     duplicates: int = 0
@@ -382,6 +427,7 @@ class RunStats:
 
 
 def load_existing_manifest(manifest_path: Path) -> tuple[list[dict], set[int], set[str]]:
+    """Load prior manifest records and collect covered offsets and hashes."""
     records: list[dict] = []
     seen_hashes: set[str] = set()
     covered_starts: set[int] = set()
@@ -408,12 +454,18 @@ def load_existing_manifest(manifest_path: Path) -> tuple[list[dict], set[int], s
 # --------------------------------------------------------------------------- #
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Carving prudent d'images et vidéos depuis un .img/.dd.")
+    """Build the command-line argument parser."""
+    p = argparse.ArgumentParser(
+        description="Carving prudent d'images et vidéos depuis un .img/.dd."
+    )
     p.add_argument("image", type=Path, help="Fichier image disque source")
     p.add_argument("-o", "--output", type=Path, default=None)
     p.add_argument("-j", "--workers", type=int, default=max(1, min(12, os.cpu_count() or 1)))
     p.add_argument("--chunk-mib", type=int, default=64)
-    p.add_argument("--min-size", type=int, default=1024, help="Taille minimale d'un fichier extrait (octets)")
+    p.add_argument(
+        "--min-size", type=int, default=1024,
+        help="Taille minimale d'un fichier extrait (octets)",
+    )
     p.add_argument("--max-files", type=int, default=0, help="Limite d'extractions (0=illimité)")
     p.add_argument("--no-dedup", action="store_true", help="Ne pas dédupliquer par hash SHA-256")
     p.add_argument("--resume", action="store_true", help="Reprendre un run existant")
@@ -426,6 +478,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def configure_logging(dest: Optional[Path], verbose: bool, quiet: bool) -> None:
+    """Configure console and optional file logging."""
     level = logging.DEBUG if verbose else (logging.WARNING if quiet else logging.INFO)
     log.setLevel(logging.DEBUG)
     log.handlers.clear()
@@ -443,6 +496,7 @@ def configure_logging(dest: Optional[Path], verbose: bool, quiet: bool) -> None:
 
 
 def hash_file(path: Path) -> str:
+    """Calculate the SHA-256 digest of a file in chunks."""
     h = hashlib.sha256()
     with open(path, "rb", buffering=0) as f:
         while True:
@@ -453,7 +507,9 @@ def hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# pylint: disable=too-many-locals,too-many-branches,too-many-statements,consider-using-with
 def main() -> int:
+    """Run the carving workflow and write recovery reports."""
     parser = build_arg_parser()
     args = parser.parse_args()
 
@@ -474,6 +530,7 @@ def main() -> int:
         dest.mkdir(parents=True, exist_ok=True)
 
     def progress(done, total):
+        """Display scan progress unless quiet mode is enabled."""
         if args.quiet:
             return
         pct = 100 * done / max(1, total)
@@ -481,7 +538,9 @@ def main() -> int:
         sys.stdout.flush()
 
     try:
-        candidates, image_size = scan_signatures(src, args.workers, args.chunk_mib * MIB, progress_cb=progress)
+        candidates, image_size = scan_signatures(
+        src, args.workers, args.chunk_mib * MIB, progress_cb=progress
+    )
     except RecupError as e:
         print()
         log.error("Échec du scan : %s", e)
@@ -499,7 +558,7 @@ def main() -> int:
     seen_hashes: set[str] = set()
 
     if args.resume and not args.dry_run:
-        records, covered_starts, seen_hashes = load_existing_manifest(manifest_path)
+        records, _covered_starts, seen_hashes = load_existing_manifest(manifest_path)
         for r in records:
             ranges.append((r["offset_decimal"], r["offset_decimal"] + r["size_bytes"]))
             stats.counts[r["type"]] = stats.counts.get(r["type"], 0) + 1
@@ -520,7 +579,7 @@ def main() -> int:
             mf = open(manifest_path, manifest_mode, encoding="utf-8")
         f = open(src, "rb", buffering=0)
 
-        for idx, (offset, ext) in enumerate(candidates, 1):
+        for offset, ext in candidates:
             if any(a <= offset < b for a, b in ranges):
                 continue
 
@@ -577,7 +636,7 @@ def main() -> int:
             seen_hashes.add(digest)
 
             stats.extracted += 1
-            
+
             val = image_validate(out, ext)
             video_meta = {}
             corrected_info = None
@@ -586,9 +645,14 @@ def main() -> int:
                 video_meta = analyze_large_video(out, length)
                 if video_meta.get("anomaly"):
                     stats.anomalies += 1
-                    log.warning("ANOMALIE DÉTECTÉE sur %s : %s", name, video_meta.get("anomaly_reason"))
-                    
-                    log.info("Lancement de la correction automatique directement dans le dossier principal...")
+                    log.warning(
+                "ANOMALIE DÉTECTÉE sur %s : %s",
+                name, video_meta.get("anomaly_reason"),
+            )
+
+                    log.info(
+                        "Lancement de la correction automatique dans le dossier principal..."
+                    )
                     res_corr = correct_video_with_ffmpeg(out, dest, ext)
                     if res_corr:
                         corr_path, corr_hash = res_corr
@@ -598,7 +662,10 @@ def main() -> int:
                             "corrected_size_bytes": corr_path.stat().st_size,
                             "corrected_sha256": corr_hash
                         }
-                        log.info("Succès de la correction -> Fichier enregistré : %s", corr_path.name)
+                        log.info(
+                            "Succès de la correction -> Fichier enregistré : %s",
+                            corr_path.name,
+                        )
 
             rec = {
                 "file": name,
@@ -632,8 +699,8 @@ def main() -> int:
 
     csv_path = dest / "rapport_recuperation.csv"
     fields = [
-        "file", "type", "offset_hex", "offset_decimal", "size_bytes", "sha256", 
-        "validation", "video_analysis", "duration_sec", "bitrate_kbps", "anomaly", "anomaly_reason", 
+        "file", "type", "offset_hex", "offset_decimal", "size_bytes", "sha256",
+        "validation", "video_analysis", "duration_sec", "bitrate_kbps", "anomaly", "anomaly_reason",
         "corrected_file", "corrected_size_bytes", "corrected_sha256", "error"
     ]
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as cf:
@@ -643,14 +710,18 @@ def main() -> int:
 
     rows = []
     for r in records:
-        anomaly_badge = "<span style='color:red;font-weight:bold;'>OUI</span>" if r.get("anomaly") else "Non"
+        anomaly_badge = (
+            "<span style='color:red;font-weight:bold;'>OUI</span>"
+            if r.get("anomaly") else "Non"
+        )
         corr_info = html.escape(r.get("corrected_file", "")) if r.get("corrected_file") else "-"
         size_mio = r['size_bytes'] / MIB
         dur = f"{r.get('duration_sec', 0):.1f}s" if r.get('duration_sec') is not None else "N/A"
         bitrate = f"{r.get('bitrate_kbps', 0)} kbps" if r.get('bitrate_kbps') is not None else "N/A"
         rows.append(
             f"<tr><td>{html.escape(r['file'])}</td><td>{r['type']}</td><td>{size_mio:.2f} Mio</td>"
-            f"<td>{dur}</td><td>{bitrate}</td><td>{anomaly_badge}</td><td>{corr_info}</td><td><code>{r['sha256'][:12]}</code></td></tr>"
+            f"<td>{dur}</td><td>{bitrate}</td><td>{anomaly_badge}</td>"
+            f"<td>{corr_info}</td><td><code>{r['sha256'][:12]}</code></td></tr>"
         )
 
     html_path = dest / "rapport_recuperation.html"
@@ -660,8 +731,12 @@ def main() -> int:
         "th,td{border:1px solid #ccc;padding:6px;text-align:left}th{background:#eee}</style>"
         "<h1>Rapport de Récupération (Vidéos & Médias)</h1>"
         f"<p>Source : {html.escape(str(src))}</p>"
-        f"<p>Extraits : {stats.extracted} | Doublons : {stats.duplicates} | Rejetés : {stats.rejected} | Anomalies : {stats.anomalies} | Corrigées : {stats.corrected}</p>"
-        "<table><thead><tr><th>Fichier</th><th>Type</th><th>Taille</th><th>Durée</th><th>Débit</th><th>Anomalie</th><th>Fichier Corrigé</th><th>SHA-256</th></tr></thead><tbody>"
+        f"<p>Extraits : {stats.extracted} | Doublons : {stats.duplicates} | "
+        f"Rejetés : {stats.rejected} | Anomalies : {stats.anomalies} | "
+        f"Corrigées : {stats.corrected}</p>"
+        "<table><thead><tr><th>Fichier</th><th>Type</th><th>Taille</th>"
+        "<th>Durée</th><th>Débit</th><th>Anomalie</th>"
+        "<th>Fichier Corrigé</th><th>SHA-256</th></tr></thead><tbody>"
         + "".join(rows) + "</tbody></table></html>",
         encoding="utf-8",
     )
