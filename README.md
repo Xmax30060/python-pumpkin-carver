@@ -161,3 +161,7 @@ Pumpkin Carver evolved from a modular proof of concept into an integrated recove
 The objective is to provide a practical Python-based alternative for recovering valuable digital files when conventional filesystem access is no longer sufficient.
 
 **Recover data. Preserve integrity. Keep carving. 🎃**
+
+## 📄 Licence
+
+Ce projet est sous licence MIT - voir le fichier [LICENSE](LICENSE) pour plus de détails.
