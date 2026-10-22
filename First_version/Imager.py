@@ -1,28 +1,63 @@
 #!/usr/bin/env python3
-# Imagerie d'un volume Windows en lecture seule, avec reprise après interruption.
-# IMPORTANT : enregistrer l'image sur un autre disque physique.
-# Ce script lit le volume logique \\.\E:, pas nécessairement toute la carte physique.
+"""
+Windows Volume Imager
+
+Creates a read-only image of a selected Windows logical volume.
+Supports resumable imaging, configurable output paths, retry handling,
+and atomic progress-state updates.
+
+Requirements:
+    - Windows
+    - Python 3.10+
+    - Administrator privileges may be required
+
+Important:
+    - The source is opened for reading only.
+    - Store the image on a different physical device.
+    - This images a logical volume, not necessarily the entire physical disk.
+"""
+
+from __future__ import annotations
 
 import ctypes
-from ctypes import wintypes
-import os
-import time
 import json
+import os
 import shutil
+import sys
+import time
+
+from ctypes import wintypes
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-# ==================== CONFIGURATION ====================
 
-DRIVE = "E:"
-CHUNK = 8 * 1024 * 1024  # 8 Mio
-RETRIES = 3
-RETRY_DELAY_SECONDS = 1.5
+# ============================================================
+# Configuration
+# ============================================================
 
-OUTPUT_DIR = Path.home() / "Downloads" / "recup_carte_sd"
-IMAGE_PATH = OUTPUT_DIR / "carte_sd.img"
-STATE_PATH = OUTPUT_DIR / "carte_sd_progress.json"
+@dataclass(frozen=True, slots=True)
+class ImagerConfig:
+    """Runtime configuration for the imaging operation."""
 
-# ==================== CONSTANTES WINDOWS ====================
+    chunk_size: int = 8 * 1024 * 1024
+    max_retries: int = 3
+    retry_delay_seconds: float = 1.5
+    checkpoint_interval: int = 128 * 1024 * 1024
+    minimum_free_space_bytes: int = 100 * 1024 * 1024
+
+    default_output_directory: Path = (
+        Path.home() / "Downloads" / "VolumeImages"
+    )
+
+
+CONFIG = ImagerConfig()
+
+
+# ============================================================
+# Windows API
+# ============================================================
 
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
@@ -30,46 +65,63 @@ FILE_SHARE_WRITE = 0x00000002
 OPEN_EXISTING = 3
 FILE_ATTRIBUTE_NORMAL = 0x00000080
 FILE_FLAG_OVERLAPPED = 0x40000000
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
 ERROR_IO_PENDING = 997
+
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 CreateFileW = kernel32.CreateFileW
 CreateFileW.argtypes = [
-    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-    wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
-    wintypes.HANDLE
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
 ]
 CreateFileW.restype = wintypes.HANDLE
 
 DeviceIoControl = kernel32.DeviceIoControl
 DeviceIoControl.argtypes = [
-    wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID,
-    wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
 ]
 DeviceIoControl.restype = wintypes.BOOL
 
 ReadFile = kernel32.ReadFile
 ReadFile.argtypes = [
-    wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
 ]
 ReadFile.restype = wintypes.BOOL
 
 GetOverlappedResult = kernel32.GetOverlappedResult
 GetOverlappedResult.argtypes = [
-    wintypes.HANDLE, wintypes.LPVOID,
-    ctypes.POINTER(wintypes.DWORD), wintypes.BOOL
+    wintypes.HANDLE,
+    wintypes.LPVOID,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.BOOL,
 ]
 GetOverlappedResult.restype = wintypes.BOOL
 
 CreateEventW = kernel32.CreateEventW
 CreateEventW.argtypes = [
-    wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL,
-    wintypes.LPCWSTR
+    wintypes.LPVOID,
+    wintypes.BOOL,
+    wintypes.BOOL,
+    wintypes.LPCWSTR,
 ]
 CreateEventW.restype = wintypes.HANDLE
 
@@ -77,42 +129,194 @@ CloseHandle = kernel32.CloseHandle
 CloseHandle.argtypes = [wintypes.HANDLE]
 CloseHandle.restype = wintypes.BOOL
 
+GetLogicalDrives = kernel32.GetLogicalDrives
+GetLogicalDrives.argtypes = []
+GetLogicalDrives.restype = wintypes.DWORD
 
-# ==================== OUTILS ====================
+GetVolumeInformationW = kernel32.GetVolumeInformationW
+GetVolumeInformationW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.LPWSTR,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPWSTR,
+    wintypes.DWORD,
+]
+GetVolumeInformationW.restype = wintypes.BOOL
 
-def win_error(message):
+
+# ============================================================
+# Exceptions and data models
+# ============================================================
+
+class ImagingError(RuntimeError):
+    """Raised when the imaging operation cannot safely continue."""
+
+
+@dataclass(frozen=True, slots=True)
+class VolumeInfo:
+    """Identifies a logical volume and its reported size."""
+
+    drive: str
+    size_bytes: int
+    serial_number: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePaths:
+    """Paths associated with an image and its progress state."""
+
+    image: Path
+    state: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeState:
+    """Persisted state required to resume an imaging operation."""
+
+    drive: str
+    total_bytes: int
+    chunk_size: int
+    serial_number: int | None
+    completed_bytes: int
+
+
+# ============================================================
+# Formatting and input
+# ============================================================
+
+def format_bytes(value: int) -> str:
+    """Format a byte count as a human-readable binary unit."""
+
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(value)
+
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+
+    return f"{size:.2f} TiB"
+
+
+def prompt_path(message: str, default: Path) -> Path:
+    """Prompt for a filesystem path with a default value."""
+
+    value = input(f"{message} [{default}]: ").strip()
+    return Path(value.strip('"')).expanduser() if value else default
+
+
+def prompt_drive() -> str:
+    """Display available drive letters and request a source volume."""
+
+    if os.name != "nt":
+        raise ImagingError("This program requires Windows.")
+
+    drive_mask = GetLogicalDrives()
+
+    available = [
+        f"{chr(65 + index)}:"
+        for index in range(26)
+        if drive_mask & (1 << index)
+    ]
+
+    print("\nAvailable logical drives:")
+    for drive in available:
+        print(f"  {drive}")
+
+    while True:
+        value = input("\nSource drive letter: ").strip().upper()
+
+        if len(value) == 1:
+            value += ":"
+
+        if value in available:
+            return value
+
+        print("Invalid selection. Choose an available drive letter.")
+
+
+def prompt_output_paths(drive: str) -> ImagePaths:
+    """Request the output directory and image filename."""
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_name = f"volume_{drive[0]}_{timestamp}.img"
+
+    output_directory = prompt_path(
+        "Output directory",
+        CONFIG.default_output_directory,
+    )
+
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    default_image_path = output_directory / default_name
+    requested_path = prompt_path(
+        "Image filename or path",
+        default_image_path,
+    )
+
+    if requested_path.is_absolute():
+        image_path = requested_path
+    else:
+        image_path = output_directory / requested_path
+
+    if image_path.suffix.lower() != ".img":
+        image_path = image_path.with_suffix(".img")
+
+    if image_path.name in ("", ".", ".."):
+        raise ImagingError("Invalid image filename.")
+
+    state_path = image_path.with_suffix(
+        image_path.suffix + ".progress.json"
+    )
+
+    return ImagePaths(image=image_path, state=state_path)
+
+
+# ============================================================
+# Source volume access
+# ============================================================
+
+def windows_error(message: str) -> OSError:
+    """Create an OSError using the most recent Windows error code."""
+
     code = ctypes.get_last_error()
-    return OSError(code, f"{message} : {ctypes.FormatError(code)}")
+    return OSError(code, f"{message}: {ctypes.FormatError(code).strip()}")
 
 
-def open_source(overlapped=False):
+def open_volume(drive: str, overlapped: bool = False) -> int:
+    """Open a logical volume with read-only access."""
+
     flags = FILE_ATTRIBUTE_NORMAL
+
     if overlapped:
         flags |= FILE_FLAG_OVERLAPPED
 
     handle = CreateFileW(
-        r"\\.\{}".format(DRIVE),
+        rf"\\.\{drive}",
         GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         None,
         OPEN_EXISTING,
         flags,
-        None
+        None,
     )
 
     if handle == INVALID_HANDLE_VALUE:
-        raise win_error(
-            "Impossible d'ouvrir le volume. Essayez en administrateur"
-        )
+        raise windows_error(f"Unable to open source volume {drive}")
 
     return handle
 
 
-def get_size(handle):
+def get_volume_size(handle: int) -> int:
+    """Retrieve the reported size of an opened volume."""
+
     length = ctypes.c_longlong()
     returned = wintypes.DWORD()
 
-    if not DeviceIoControl(
+    success = DeviceIoControl(
         handle,
         IOCTL_DISK_GET_LENGTH_INFO,
         None,
@@ -120,310 +324,490 @@ def get_size(handle):
         ctypes.byref(length),
         ctypes.sizeof(length),
         ctypes.byref(returned),
-        None
-    ):
-        raise win_error("Impossible de lire la taille du volume")
+        None,
+    )
+
+    if not success:
+        raise windows_error("Unable to determine volume size")
 
     if length.value <= 0:
-        raise RuntimeError("Taille de volume invalide")
+        raise ImagingError("The volume reported an invalid size.")
 
     return length.value
 
 
-def save_state(total, done):
-    tmp = STATE_PATH.with_suffix(".tmp")
+def get_volume_serial(drive: str) -> int | None:
+    """Retrieve the filesystem volume serial number when available."""
 
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({
-            "drive": DRIVE,
-            "total": total,
-            "done": done,
-            "chunk": CHUNK
-        }, f)
-        f.flush()
-        os.fsync(f.fileno())
+    serial = wintypes.DWORD()
+    maximum_component_length = wintypes.DWORD()
+    filesystem_flags = wintypes.DWORD()
 
-    os.replace(tmp, STATE_PATH)
+    volume_name = ctypes.create_unicode_buffer(261)
+    filesystem_name = ctypes.create_unicode_buffer(261)
+
+    success = GetVolumeInformationW(
+        f"{drive}\\",
+        volume_name,
+        len(volume_name),
+        ctypes.byref(serial),
+        ctypes.byref(maximum_component_length),
+        ctypes.byref(filesystem_flags),
+        filesystem_name,
+        len(filesystem_name),
+    )
+
+    return serial.value if success else None
 
 
-# ==================== LECTURE À UN OFFSET PRÉCIS ====================
+def inspect_volume(drive: str) -> VolumeInfo:
+    """Inspect the source volume and return its identifying information."""
 
-def read_at(handle, offset, size):
-    class OVERLAPPED(ctypes.Structure):
-        _fields_ = [
-            ("Internal", ctypes.c_size_t),
-            ("InternalHigh", ctypes.c_size_t),
-            ("Offset", wintypes.DWORD),
-            ("OffsetHigh", wintypes.DWORD),
-            ("hEvent", wintypes.HANDLE),
-        ]
-
-    ov = OVERLAPPED()
-    ov.Offset = offset & 0xFFFFFFFF
-    ov.OffsetHigh = (offset >> 32) & 0xFFFFFFFF
-
-    event = CreateEventW(None, True, False, None)
-    if not event:
-        raise win_error("Impossible de créer l'événement de lecture")
-
-    ov.hEvent = event
-    buf = ctypes.create_string_buffer(size)
-    got = wintypes.DWORD()
+    handle = open_volume(drive)
 
     try:
-        ok = ReadFile(
-            handle, buf, size,
-            ctypes.byref(got), ctypes.byref(ov)
+        size_bytes = get_volume_size(handle)
+    finally:
+        CloseHandle(handle)
+
+    return VolumeInfo(
+        drive=drive,
+        size_bytes=size_bytes,
+        serial_number=get_volume_serial(drive),
+    )
+
+
+# ============================================================
+# Offset-based asynchronous reads
+# ============================================================
+
+class OVERLAPPED(ctypes.Structure):
+    """Windows OVERLAPPED structure for explicit-offset reads."""
+
+    _fields_ = [
+        ("Internal", ctypes.c_size_t),
+        ("InternalHigh", ctypes.c_size_t),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
+
+def read_at(handle: int, offset: int, size: int) -> bytes:
+    """Read exactly one requested chunk at a specific byte offset."""
+
+    overlapped = OVERLAPPED()
+    overlapped.Offset = offset & 0xFFFFFFFF
+    overlapped.OffsetHigh = (offset >> 32) & 0xFFFFFFFF
+
+    event = CreateEventW(None, True, False, None)
+
+    if not event:
+        raise windows_error("Unable to create read event")
+
+    overlapped.hEvent = event
+    buffer = ctypes.create_string_buffer(size)
+    bytes_read = wintypes.DWORD()
+
+    try:
+        success = ReadFile(
+            handle,
+            buffer,
+            size,
+            ctypes.byref(bytes_read),
+            ctypes.byref(overlapped),
         )
 
-        if not ok:
-            err = ctypes.get_last_error()
+        if not success:
+            error_code = ctypes.get_last_error()
 
-            if err != ERROR_IO_PENDING:
+            if error_code != ERROR_IO_PENDING:
                 raise OSError(
-                    err,
-                    f"Lecture à l'offset {offset} impossible : "
-                    f"{ctypes.FormatError(err)}"
+                    error_code,
+                    f"Read failed at offset {offset}: "
+                    f"{ctypes.FormatError(error_code).strip()}",
                 )
 
             if not GetOverlappedResult(
-                handle, ctypes.byref(ov),
-                ctypes.byref(got), True
+                handle,
+                ctypes.byref(overlapped),
+                ctypes.byref(bytes_read),
+                True,
             ):
-                raise win_error(
-                    f"Lecture à l'offset {offset} impossible"
-                )
+                raise windows_error(f"Read failed at offset {offset}")
 
-        if got.value == 0:
-            return b""
+        if bytes_read.value != size:
+            raise OSError(
+                f"Short read at offset {offset}: "
+                f"expected {size} bytes, received {bytes_read.value}"
+            )
 
-        return buf.raw[:got.value]
+        return buffer.raw[:bytes_read.value]
 
     finally:
         CloseHandle(event)
 
 
-# ==================== CRÉATION ET REPRISE DE L'IMAGE ====================
+# ============================================================
+# Progress persistence and resume validation
+# ============================================================
 
-def image_volume():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def save_state(paths: ImagePaths, state: ResumeState) -> None:
+    """Persist progress using a temporary file and atomic replacement."""
 
-    print(f"Source : \\\\.\\{DRIVE}")
-    print(f"Image  : {IMAGE_PATH}")
-    print(f"Taille de bloc : {CHUNK // (1024 * 1024)} Mio")
-    print("Lecture seule de la source.")
-    print("Vérifiez que le lecteur sélectionné correspond à la carte SD.")
+    temporary_path = paths.state.with_name(
+        paths.state.name + ".tmp"
+    )
 
-    if input("Tapez OUI pour continuer : ").strip() != "OUI":
-        print("Annulé.")
+    payload = {
+        "version": 1,
+        "drive": state.drive,
+        "total_bytes": state.total_bytes,
+        "chunk_size": state.chunk_size,
+        "serial_number": state.serial_number,
+        "completed_bytes": state.completed_bytes,
+    }
+
+    try:
+        with temporary_path.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        os.replace(temporary_path, paths.state)
+
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def load_state(paths: ImagePaths) -> ResumeState:
+    """Load and validate the saved progress metadata."""
+
+    try:
+        payload: dict[str, Any] = json.loads(
+            paths.state.read_text(encoding="utf-8")
+        )
+
+        if payload.get("version") != 1:
+            raise ImagingError("Unsupported progress file version.")
+
+        serial = payload.get("serial_number")
+
+        state = ResumeState(
+            drive=str(payload["drive"]),
+            total_bytes=int(payload["total_bytes"]),
+            chunk_size=int(payload["chunk_size"]),
+            serial_number=None if serial is None else int(serial),
+            completed_bytes=int(payload["completed_bytes"]),
+        )
+
+    except ImagingError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise ImagingError(
+            f"Unable to load progress metadata: {exc}"
+        ) from exc
+
+    if (
+        state.total_bytes <= 0
+        or state.chunk_size <= 0
+        or state.completed_bytes < 0
+        or state.completed_bytes > state.total_bytes
+        or state.completed_bytes % state.chunk_size != 0
+    ):
+        raise ImagingError("Progress metadata contains invalid offsets.")
+
+    return state
+
+
+def initialize_or_resume(
+    paths: ImagePaths,
+    volume: VolumeInfo,
+) -> int:
+    """Initialize a new image or validate a previous imaging session."""
+
+    image_exists = paths.image.exists()
+    state_exists = paths.state.exists()
+
+    if image_exists != state_exists:
+        raise ImagingError(
+            "The image and progress file must both exist or both be absent. "
+            "No automatic recovery will be attempted."
+        )
+
+    if not image_exists:
+        free_space = shutil.disk_usage(paths.image.parent).free
+        required_space = (
+            volume.size_bytes + CONFIG.minimum_free_space_bytes
+        )
+
+        if free_space < required_space:
+            raise ImagingError(
+                f"Insufficient destination space. "
+                f"Required: {format_bytes(required_space)}; "
+                f"available: {format_bytes(free_space)}."
+            )
+
+        # Exclusive creation prevents overwriting an existing image.
+        with paths.image.open("xb") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        state = ResumeState(
+            drive=volume.drive,
+            total_bytes=volume.size_bytes,
+            chunk_size=CONFIG.chunk_size,
+            serial_number=volume.serial_number,
+            completed_bytes=0,
+        )
+
+        save_state(paths, state)
+        return 0
+
+    state = load_state(paths)
+
+    if (
+        state.drive != volume.drive
+        or state.total_bytes != volume.size_bytes
+        or state.chunk_size != CONFIG.chunk_size
+        or state.serial_number != volume.serial_number
+    ):
+        raise ImagingError(
+            "The saved session does not match the current source "
+            "or imaging configuration. Refusing to resume."
+        )
+
+    image_size = paths.image.stat().st_size
+
+    if image_size < state.completed_bytes:
+        raise ImagingError(
+            "The image is shorter than the last committed checkpoint."
+        )
+
+    # Bytes beyond the saved checkpoint may not have been committed.
+    # The imaging loop will truncate them before continuing.
+    print(f"Existing image: {format_bytes(image_size)}")
+    print(f"Committed data: {format_bytes(state.completed_bytes)}")
+
+    return state.completed_bytes
+
+
+# ============================================================
+# Imaging engine
+# ============================================================
+
+def write_all(stream: Any, data: bytes) -> None:
+    """Write all bytes or raise an error if progress cannot continue."""
+
+    remaining = memoryview(data)
+
+    while remaining:
+        written = stream.write(remaining)
+
+        if written is None or written <= 0:
+            raise OSError("Unable to write image data.")
+
+        remaining = remaining[written:]
+
+
+def image_volume(
+    volume: VolumeInfo,
+    paths: ImagePaths,
+) -> None:
+    """Create or resume a volume image."""
+
+    completed = initialize_or_resume(paths, volume)
+
+    if completed == volume.size_bytes:
+        print("The image is already complete.")
+        return
+
+    print(f"\nSource volume : {volume.drive}")
+    print(f"Source size   : {format_bytes(volume.size_bytes)}")
+    print(f"Image path    : {paths.image}")
+    print(f"Resume offset : {format_bytes(completed)}")
+
+    if input("\nType YES to continue: ").strip() != "YES":
+        print("Operation cancelled.")
         return
 
     handle = None
+    next_checkpoint = (
+        completed // CONFIG.checkpoint_interval + 1
+    ) * CONFIG.checkpoint_interval
 
     try:
-        handle = open_source()
-        total = get_size(handle)
-        done = 0
+        with paths.image.open("r+b", buffering=0) as output:
+            output.truncate(completed)
+            output.seek(completed)
 
-        if IMAGE_PATH.exists():
-            image_size = IMAGE_PATH.stat().st_size
-
-            if STATE_PATH.exists():
-                try:
-                    state = json.loads(
-                        STATE_PATH.read_text(encoding="utf-8")
-                    )
-
-                    if (
-                        state.get("drive") != DRIVE
-                        or int(state.get("total", -1)) != total
-                    ):
-                        print(
-                            "L'état sauvegardé ne correspond pas à "
-                            "la source actuelle. Arrêt prudent."
-                        )
-                        return
-
-                    # Ne pas dépasser les données réellement présentes.
-                    done = min(
-                        image_size,
-                        max(0, int(state.get("done", 0)))
-                    )
-
-                except Exception as exc:
-                    print(f"Progression illisible : {exc}")
-                    print(
-                        "Reprise depuis la taille réelle de l'image, "
-                        "arrondie au bloc complet."
-                    )
-                    done = min(image_size, total)
-
-            else:
-                # Sans fichier d'état, utiliser uniquement les blocs
-                # complets réellement présents dans l'image.
-                done = min(image_size, total)
-
-            done = (done // CHUNK) * CHUNK
-
-            print(
-                f"Image existante : "
-                f"{image_size / (1024 ** 3):.2f} Gio"
-            )
-            print(
-                f"Reprise à l'offset : "
-                f"{done / (1024 ** 3):.2f} Gio"
-            )
-
-            save_state(total, done)
-
-        elif STATE_PATH.exists():
-            print(
-                "Le fichier de progression existe, mais l'image est "
-                "absente. Arrêt prudent."
-            )
-            return
-
-        else:
-            free = shutil.disk_usage(OUTPUT_DIR).free
-
-            if free < total + 100 * 1024 * 1024:
-                raise RuntimeError(
-                    f"Espace libre insuffisant : "
-                    f"{free / (1024 ** 3):.2f} Gio."
+            while completed < volume.size_bytes:
+                requested_size = min(
+                    CONFIG.chunk_size,
+                    volume.size_bytes - completed,
                 )
 
-            with open(IMAGE_PATH, "xb") as f:
-                f.flush()
-                os.fsync(f.fileno())
+                data = None
+                last_error = None
 
-            save_state(total, 0)
-
-        if done == total:
-            print("Image déjà complète.")
-            return
-
-        with open(IMAGE_PATH, "r+b", buffering=0) as out:
-            # Éliminer toute fin qui ne correspond pas au point
-            # de reprise validé.
-            out.truncate(done)
-            out.seek(done)
-
-            while done < total:
-                want = min(CHUNK, total - done)
-                chunk_data = None
-
-                for attempt in range(1, RETRIES + 1):
+                for attempt in range(1, CONFIG.max_retries + 1):
                     if handle is not None:
                         CloseHandle(handle)
                         handle = None
 
                     try:
-                        # Vérifier que la taille du volume n'a pas changé.
-                        check_handle = open_source()
+                        check_handle = open_volume(volume.drive)
 
                         try:
-                            current_total = get_size(check_handle)
+                            current_size = get_volume_size(check_handle)
                         finally:
                             CloseHandle(check_handle)
 
-                        if current_total != total:
-                            raise RuntimeError(
-                                "La taille du volume a changé. Arrêt."
+                        if current_size != volume.size_bytes:
+                            raise ImagingError(
+                                "The source volume size has changed."
                             )
 
-                        handle = open_source(overlapped=True)
-                        chunk_data = read_at(handle, done, want)
+                        handle = open_volume(
+                            volume.drive,
+                            overlapped=True,
+                        )
 
-                        if len(chunk_data) != want:
-                            raise OSError(
-                                f"Lecture incomplète : "
-                                f"{len(chunk_data)} octets sur {want}."
-                            )
-
+                        data = read_at(
+                            handle,
+                            completed,
+                            requested_size,
+                        )
                         break
 
                     except Exception as exc:
+                        last_error = exc
                         print(
-                            f"\nErreur à {done / (1024 ** 3):.3f} Gio "
-                            f"(essai {attempt}/{RETRIES}) : {exc}"
+                            f"\nRead error at {format_bytes(completed)} "
+                            f"(attempt {attempt}/{CONFIG.max_retries}): "
+                            f"{exc}"
                         )
 
                         if handle is not None:
                             CloseHandle(handle)
                             handle = None
 
-                        if attempt < RETRIES:
-                            time.sleep(RETRY_DELAY_SECONDS)
+                        if attempt < CONFIG.max_retries:
+                            time.sleep(CONFIG.retry_delay_seconds)
 
-                if chunk_data is None:
-                    out.flush()
-                    os.fsync(out.fileno())
-                    save_state(total, done)
+                if data is None:
+                    output.flush()
+                    os.fsync(output.fileno())
 
-                    print(
-                        f"\nArrêt sécurisé. Progression sauvegardée "
-                        f"à {done / (1024 ** 3):.3f} Gio."
+                    save_state(
+                        paths,
+                        ResumeState(
+                            drive=volume.drive,
+                            total_bytes=volume.size_bytes,
+                            chunk_size=CONFIG.chunk_size,
+                            serial_number=volume.serial_number,
+                            completed_bytes=completed,
+                        ),
                     )
-                    print(
-                        "Vérifiez le lecteur USB, les contacts et "
-                        "la carte, puis relancez le script."
+
+                    raise ImagingError(
+                        f"Maximum read retries exceeded at "
+                        f"{format_bytes(completed)}. "
+                        f"Resume the operation after checking the source. "
+                        f"Last error: {last_error}"
                     )
-                    return
 
-                out.write(chunk_data)
-                done += len(chunk_data)
+                write_all(output, data)
+                completed += len(data)
 
-                # Synchroniser périodiquement l'image et sa progression.
                 if (
-                    done % (128 * 1024 * 1024) < CHUNK
-                    or done == total
+                    completed >= next_checkpoint
+                    or completed == volume.size_bytes
                 ):
-                    out.flush()
-                    os.fsync(out.fileno())
-                    save_state(total, done)
+                    output.flush()
+                    os.fsync(output.fileno())
 
-                    print(
-                        f"\rImage : {100 * done / total:6.2f}% "
-                        f"({done / (1024 ** 3):.2f}/"
-                        f"{total / (1024 ** 3):.2f} Gio)",
-                        end="",
-                        flush=True
+                    save_state(
+                        paths,
+                        ResumeState(
+                            drive=volume.drive,
+                            total_bytes=volume.size_bytes,
+                            chunk_size=CONFIG.chunk_size,
+                            serial_number=volume.serial_number,
+                            completed_bytes=completed,
+                        ),
                     )
 
-        print(f"\nImage terminée : {IMAGE_PATH}")
+                    percentage = (
+                        100.0 * completed / volume.size_bytes
+                    )
+
+                    print(
+                        f"\rProgress: {percentage:6.2f}% | "
+                        f"{format_bytes(completed)} / "
+                        f"{format_bytes(volume.size_bytes)}",
+                        end="",
+                        flush=True,
+                    )
+
+                    next_checkpoint = (
+                        completed // CONFIG.checkpoint_interval + 1
+                    ) * CONFIG.checkpoint_interval
+
+        print(f"\n\nImage completed successfully: {paths.image}")
 
     finally:
         if handle is not None:
             CloseHandle(handle)
 
 
-# ==================== POINT D'ENTRÉE ====================
+# ============================================================
+# Application entry point
+# ============================================================
 
-def main():
+def main() -> int:
+    """Run the interactive imaging application."""
+
     if os.name != "nt":
-        print("Ce script est prévu pour Windows.")
-        return
+        print("Error: this application requires Windows.")
+        return 1
 
-    print("=" * 64)
-    print("CARTE SD - CRÉATION D'IMAGE AVEC REPRISE")
-    print("=" * 64)
-    print(
-        "Conseil : fermez l'Explorateur Windows et les applications "
-        "qui utilisent le lecteur."
-    )
-    print(
-        "En cas d'interruption, relancez le script en conservant "
-        "l'image et le fichier de progression."
-    )
+    try:
+        drive = prompt_drive()
+        paths = prompt_output_paths(drive)
 
-    image_volume()
+        source_drive = f"{drive[0]}:\\"
+        destination_root = paths.image.parent.resolve()
+
+        # Prevent writing the image onto the selected source volume.
+        if destination_root.drive.upper() == source_drive[:2].upper():
+            raise ImagingError(
+                "The destination is on the selected source volume. "
+                "Choose a different destination drive."
+            )
+
+        volume = inspect_volume(drive)
+
+        print("\nVolume information")
+        print("------------------")
+        print(f"Drive         : {volume.drive}")
+        print(f"Size          : {format_bytes(volume.size_bytes)}")
+        print(f"Volume serial : {volume.serial_number}")
+        print(f"Image         : {paths.image}")
+        print(f"Progress file : {paths.state}")
+
+        image_volume(volume, paths)
+        return 0
+
+    except (ImagingError, OSError, ValueError) as exc:
+        print(f"\nImaging failed: {exc}")
+        return 1
 
 
 if __name__ == "__main__":
     try:
-        main()
-    except Exception as exc:
-        print(f"\nARRÊT : {exc}")
-        print("Aucune écriture volontaire n'a été faite sur la source.")
-
-    input("\nAppuyez sur Entrée pour fermer...")
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Saved progress can be used to resume.")
+        sys.exit(130)
