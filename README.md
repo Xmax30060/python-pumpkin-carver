@@ -1,14 +1,13 @@
-# 🎃 Pumpkin Carver
+🎃 Pumpkin Carver
 
-**Python-based file carving and data recovery for corrupted or inaccessible storage volumes.**
+Python-based file carving and data recovery for corrupted or inaccessible storage volumes.
 
 Pumpkin Carver is a data recovery project designed to extract images, videos, and documents from disk images using file signature detection and carving techniques.
 
 The project contains two implementations: an original modular prototype and an integrated application with a graphical interface.
 
-## 📁 Project Structure
+📁 Project Structure
 
-```text
 Pumpkin-Carver/
 ├── CLI_per_role_source_code/
 │   ├── Imager.py
@@ -20,148 +19,190 @@ Pumpkin-Carver/
 │   └── pumpkin_carver_integrated_v2.py
 │
 └── README.md
-```
 
-## ⚙️ Requirements
 
-- Python 3.10 or newer
-- Windows for `Imager.py`
-- Python packages: `flet`, with `Pillow` and `psutil` optional for additional features in the integrated application
-- Sufficient disk space for disk images and recovered files
+⚙️ Requirements & Environment Setup
 
-For the modular carving scripts, install Pillow to enable image validation and additional image-processing features:
+1. Python Requirements
 
-```bash
+Python 3.10 or newer installed and added to your system PATH.
+
+Windows is required for Imager.py (due to Windows volume access APIs). Other carving scripts are cross-platform.
+
+Sufficient disk space for creating disk images and storing recovered files.
+
+2. Python Packages Installation
+
+Install the required packages depending on your use case:
+
+For modular carving scripts (Pillow for image validation):
+
 python -m pip install Pillow
-```
 
-For the integrated application:
 
-```bash
+For the integrated application (flet, Pillow, psutil):
+
 python -m pip install flet Pillow psutil
-```
 
-For optional video analysis and repair, install FFmpeg, including `ffprobe`, and ensure both executables are available on your system PATH.
 
-## 🚀 Option 1 — Run the Modular Prototype
+🎬 FFmpeg Guidelines & Installation
+
+For optional video analysis, validation, and repair features, FFmpeg (including ffprobe) must be installed on your system and accessible via your system PATH.
+
+Installation Instructions by Operating System
+
+🪟 Windows
+
+Download FFmpeg: Download the official build from ffmpeg.org (e.g., precompiled builds from gyan.dev as a .zip).
+
+Extract: Extract the downloaded archive to a permanent folder on your system (e.g., C:\ffmpeg or C:\Program Files\ffmpeg).
+
+Add to System PATH:
+
+Press the Windows Key and type Environment Variables, then select Edit the system environment variables.
+
+Click the Environment Variables... button.
+
+Under System variables, find and select the variable named Path, then click Edit.
+
+Click New and add the path to the bin folder inside your FFmpeg directory (e.g., C:\ffmpeg\bin).
+
+Click OK on all windows to save changes.
+
+Verify Installation: Open a new Command Prompt or PowerShell window and run:
+
+ffmpeg -version
+ffprobe -version
+
+
+🍎 macOS
+
+Using Homebrew (recommended):
+
+brew install ffmpeg
+
+
+Verify Installation: Open Terminal and run:
+
+ffmpeg -version
+ffprobe -version
+
+
+🐧 Linux (Ubuntu / Debian / Fedora / Arch)
+
+Ubuntu / Debian:
+
+sudo apt update
+sudo apt install ffmpeg
+
+
+Fedora:
+
+sudo dnf install ffmpeg
+
+
+Arch Linux:
+
+sudo pacman -S ffmpeg
+
+
+Verify Installation: Run:
+
+ffmpeg -version
+ffprobe -version
+
+
+🚀 Option 1 — Run the Modular Prototype
 
 The modular version separates disk imaging from file recovery.
 
-### Step 1 — Create a disk image
+Step 1 — Create a disk image
 
 Open a terminal in the project directory and run:
 
-```bash
 cd CLI_per_role_source_code
 python Imager.py
-```
 
-Follow the prompts to:
 
-1. Select the source Windows volume.
-2. Choose an output directory on a different physical drive.
-3. Specify the `.img` filename.
-4. Wait for the imaging process to finish.
+Follow the prompts to select the source Windows volume, choose an output directory on a different physical drive, specify the .img filename, and wait for completion. (Supports progress tracking and resume).
 
-The imager supports progress tracking and resuming interrupted acquisitions.
+Step 2 — Recover images and documents
 
-### Step 2 — Recover images and documents
-
-Run the carving script with your disk image and a recovery destination:
-
-```bash
 python "Image&Document_carving.py" "D:\Images\volume.img" -o "E:\Recovered\Images"
-```
 
-Replace the example paths with your actual disk image and recovery destination.
 
-This script supports JPG, PNG, GIF, BMP, and PDF carving.
+(Supports JPG, PNG, GIF, BMP, and PDF carving).
 
-### Step 3 — Recover videos
+Step 3 — Recover videos
 
-Run:
-
-```bash
 python Video_Carving_only.py "D:\Images\volume.img" -o "E:\Recovered\Videos"
-```
 
-The script targets supported video formats, including MP4, MKV, MOV, and AVI, alongside the media formats defined in its implementation.
 
-Both carving scripts support options for parallel processing, output limits, and resuming interrupted recovery runs.
+(Supports MP4, MKV, MOV, AVI, and other media formats).
 
-## 🖥️ Option 2 — Run the Integrated Application
+🖥️ Option 2 — Run the Integrated Application
 
-The integrated version combines imaging and file carving in a graphical application.
+Step 1 — Navigate to the integrated directory
 
-### Step 1 — Navigate to the integrated directory
-
-```bash
 cd UI_AllInOne_source_code
-```
 
-### Step 2 — Launch the application
 
-**Version 1**
+Step 2 — Launch the application
 
-```bash
+Version 1:
+
 python pumpkin_carver_integrated.py
-```
 
-**Version 2**
 
-```bash
+Version 2:
+
 python pumpkin_carver_integrated_v2.py
-```
 
-Choose either version to launch its graphical interface.
 
-### Step 3 — Select a recovery workflow
+Step 3 — Select a recovery workflow & execute
 
-The integrated application provides three main workflows:
+Choose from Setup Carving, Full Carving, or Extraction from an existing image.
 
-- **Setup Carving:** Create a disk image of a selected volume.
-- **Full Carving:** Image a volume and then carve the selected file categories.
-- **Extraction from an existing image:** Recover files directly from an existing disk image without acquiring the volume again.
+Select source volume/image, output directory, and file categories.
 
-### Step 4 — Configure and start recovery
+Start operation, monitor progress, and review generated recovery reports.
 
-1. Select the desired workflow.
-2. Choose the source volume or existing disk image.
-3. Select the output directory and file categories.
-4. Configure recovery options as needed.
-5. Start the operation and monitor the progress.
-6. Review the extracted files and generated recovery reports.
+⚡ Features
 
-Recovered files are organized into category folders, including photos, videos, audio, documents, and archives.
+Disk imaging with read-only source access
 
-## ⚡ Features
+File carving based on file signatures
 
-- Disk imaging with read-only source access
-- File carving based on file signatures
-- Image, video, and document recovery
-- Integrated graphical interface
-- Parallel processing for carving
-- SHA-256 hashing and duplicate detection
-- Recovery progress tracking and resume support
-- Recovery reports in supported implementations
-- Optional image validation and video analysis
+Image, video, and document recovery
 
-## 🛡️ Important Notes
+Integrated graphical interface (Flet)
 
-- **Never save recovered files onto the affected source drive.**
-- Whenever possible, work from a disk image rather than repeatedly accessing a damaged device.
-- File carving cannot guarantee complete recovery, especially when data has been overwritten or files are fragmented.
-- A recovered file may be incomplete or corrupted even if it has been extracted successfully.
-- This project is not a certified forensic tool for judicial use.
+Parallel processing for carving
 
-## 🎯 Project Goal
+SHA-256 hashing and duplicate detection
 
-Pumpkin Carver evolved from a modular proof of concept into an integrated recovery application, with a focus on simplifying file carving and improving processing performance.
+Recovery progress tracking and resume support
 
-The objective is to provide a practical Python-based alternative for recovering valuable digital files when conventional filesystem access is no longer sufficient.
+Recovery reports in supported implementations
 
-**Recover data. Preserve integrity. Keep carving. 🎃**
+Optional image validation and FFmpeg-powered video analysis
 
-## 📄 Licence
+🛡️ Important Notes
 
-Ce projet est sous licence MIT - voir le fichier [LICENSE](LICENSE) pour plus de détails.
+Never save recovered files onto the affected source drive.
+
+Whenever possible, work from a disk image rather than repeatedly accessing a damaged device.
+
+File carving cannot guarantee complete recovery when data is overwritten or fragmented.
+
+This project is not a certified forensic tool for judicial use.
+
+🎯 Project Goal
+
+Pumpkin Carver evolved from a modular proof of concept into an integrated recovery application, simplifying file carving and improving processing performance.
+
+Recover data. Preserve integrity. Keep carving. 🎃
+
+📄 Licence
+
+Ce projet est sous licence MIT - voir le fichier LICENSE pour plus de détails.
