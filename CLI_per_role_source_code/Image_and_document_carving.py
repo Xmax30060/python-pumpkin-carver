@@ -27,6 +27,7 @@ secteurs ne sont pas contigus. La réparation peut récupérer une partie
 visible, pas les octets perdus. Ce script ne remplace pas un outil de
 forensique certifié (ex. PhotoRec, Autopsy) pour un usage judiciaire.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -63,9 +64,29 @@ SIGNATURES: tuple[tuple[str, bytes], ...] = (
     ("gif", b"GIF89a"),
     ("bmp", b"BM"),
 )
-MAX_SIZES = {"jpg": 256 * MIB, "png": 512 * MIB, "pdf": 512 * MIB, "gif": 128 * MIB, "bmp": 256 * MIB}
+MAX_SIZES = {
+    "jpg": 256 * MIB,
+    "png": 512 * MIB,
+    "pdf": 512 * MIB,
+    "gif": 128 * MIB,
+    "bmp": 256 * MIB,
+}
 OVERLAP = max(len(sig) for _, sig in SIGNATURES) - 1
-JPEG_SOF = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+JPEG_SOF = {
+    0xC0,
+    0xC1,
+    0xC2,
+    0xC3,
+    0xC5,
+    0xC6,
+    0xC7,
+    0xC9,
+    0xCA,
+    0xCB,
+    0xCD,
+    0xCE,
+    0xCF,
+}
 HASH_CHUNK = 8 * MIB
 WRITE_CHUNK = 8 * MIB
 MANIFEST_SCHEMA_VERSION = 2
@@ -76,6 +97,7 @@ log = logging.getLogger("recup_after")
 # --------------------------------------------------------------------------- #
 # Erreurs dédiées (remplace les comparaisons de chaînes / codes de sortie nus)
 # --------------------------------------------------------------------------- #
+
 
 class RecupError(Exception):
     """Erreur attendue, destinée à être affichée proprement à l'utilisateur."""
@@ -88,6 +110,7 @@ class SourceIntegrityError(RecupError):
 # --------------------------------------------------------------------------- #
 # Scan des signatures (multi-processus)
 # --------------------------------------------------------------------------- #
+
 
 def scan_range(job: tuple[str, int, int, int]) -> list[tuple[int, str]]:
     """Cherche toutes les signatures connues dans [start, stop) d'un fichier.
@@ -136,12 +159,20 @@ def scan_signatures(
     size = path.stat().st_size
     if size == 0:
         return [], 0
-    jobs = [(str(path), s, min(size, s + chunk_size), chunk_size) for s in range(0, size, chunk_size)]
+    jobs = [
+        (str(path), s, min(size, s + chunk_size), chunk_size)
+        for s in range(0, size, chunk_size)
+    ]
     found: list[tuple[int, str]] = []
     done = 0
     total = len(jobs)
     log.info("Image : %s (%.2f Gio)", path, size / GIB)
-    log.info("Scan : %d processus, blocs de %.0f Mio, %d tâches", workers, chunk_size / MIB, total)
+    log.info(
+        "Scan : %d processus, blocs de %.0f Mio, %d tâches",
+        workers,
+        chunk_size / MIB,
+        total,
+    )
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(scan_range, j) for j in jobs]
         try:
@@ -162,7 +193,10 @@ def scan_signatures(
 # d'écriture, et borne toujours ses lectures par MAX_SIZES / image_size.
 # --------------------------------------------------------------------------- #
 
-def find_marker(f, offset: int, limit: int, marker: bytes, start_after: int = 0) -> Optional[int]:
+
+def find_marker(
+    f, offset: int, limit: int, marker: bytes, start_after: int = 0
+) -> Optional[int]:
     f.seek(offset + start_after)
     cursor = offset + start_after
     carry = b""
@@ -174,12 +208,14 @@ def find_marker(f, offset: int, limit: int, marker: bytes, start_after: int = 0)
         idx = data.find(marker)
         if idx >= 0:
             return cursor - len(carry) + idx + len(marker) - offset
-        carry = data[-max(1, len(marker) - 1):]
+        carry = data[-max(1, len(marker) - 1) :]
         cursor += len(block)
     return None
 
 
-def jpeg_dimensions(f, offset: int, max_end: int, header_scan_limit: int = 8 * MIB) -> Optional[tuple[int, int]]:
+def jpeg_dimensions(
+    f, offset: int, max_end: int, header_scan_limit: int = 8 * MIB
+) -> Optional[tuple[int, int]]:
     """Parse les marqueurs JPEG jusqu'à SOF et retourne (largeur, hauteur).
 
     header_scan_limit borne la recherche du SOF à partir du début du fichier
@@ -224,7 +260,13 @@ def jpeg_dimensions(f, offset: int, max_end: int, header_scan_limit: int = 8 * M
             if len(payload) < 5:
                 return None
             height, width = struct.unpack(">HH", payload[1:5])
-            if width < 1 or height < 1 or width > 100_000 or height > 100_000 or width * height > 500_000_000:
+            if (
+                width < 1
+                or height < 1
+                or width > 100_000
+                or height > 100_000
+                or width * height > 500_000_000
+            ):
                 return None
             return width, height
         pos += seglen
@@ -342,8 +384,15 @@ def _find_jpeg_eoi_structural(f, offset: int, limit: int) -> Optional[int]:
     return None
 
 
-def jpeg_length(f, offset: int, image_size: int, next_jpeg: Optional[int] = None, salvage: bool = True,
-                 salvage_min: int = 4096, salvage_max: int = 64 * MIB):
+def jpeg_length(
+    f,
+    offset: int,
+    image_size: int,
+    next_jpeg: Optional[int] = None,
+    salvage: bool = True,
+    salvage_min: int = 4096,
+    salvage_max: int = 64 * MIB,
+):
     limit = min(image_size, offset + MAX_SIZES["jpg"])
     end = _find_jpeg_eoi_structural(f, offset, limit)
     if end is not None:
@@ -400,8 +449,14 @@ def bmp_length(f, offset: int, image_size: int) -> Optional[int]:
     size = struct.unpack_from("<I", h, 2)[0]
     pix = struct.unpack_from("<I", h, 10)[0]
     dib = struct.unpack_from("<I", h, 14)[0]
-    if dib not in (12, 40, 52, 56, 64, 108, 124) or size < 26 or size > MAX_SIZES["bmp"] \
-            or pix < 14 + dib or pix >= size or size > image_size - offset:
+    if (
+        dib not in (12, 40, 52, 56, 64, 108, 124)
+        or size < 26
+        or size > MAX_SIZES["bmp"]
+        or pix < 14 + dib
+        or pix >= size
+        or size > image_size - offset
+    ):
         return None
     if dib == 12:
         width, height = struct.unpack_from("<HH", h, 18)
@@ -411,8 +466,15 @@ def bmp_length(f, offset: int, image_size: int) -> Optional[int]:
         width, height = struct.unpack_from("<ii", h, 18)
         planes, bpp = struct.unpack_from("<HH", h, 26)
         comp = struct.unpack_from("<I", h, 30)[0]
-    if width == 0 or height == 0 or abs(width) > 100_000 or abs(height) > 100_000 \
-            or planes != 1 or bpp not in (1, 2, 4, 8, 16, 24, 32) or comp not in (0, 1, 2, 3, 6):
+    if (
+        width == 0
+        or height == 0
+        or abs(width) > 100_000
+        or abs(height) > 100_000
+        or planes != 1
+        or bpp not in (1, 2, 4, 8, 16, 24, 32)
+        or comp not in (0, 1, 2, 3, 6)
+    ):
         return None
     row = ((abs(width) * bpp + 31) // 32) * 4
     if comp == 0 and pix + row * abs(height) > size:
@@ -447,11 +509,9 @@ def pdf_length(f, offset: int, image_size: int) -> Optional[int]:
     return last
 
 
-
 # --------------------------------------------------------------------------- #
 # EXIF enrichi + détection de miniature imbriquée
 # --------------------------------------------------------------------------- #
-
 _EXIF_TAG_DATETIME_ORIGINAL = 36867
 _EXIF_TAG_DATETIME_DIGITIZED = 36868
 _EXIF_TAG_DATETIME = 306
@@ -481,11 +541,16 @@ def _clean_exif_str(value) -> Optional[str]:
 def extract_exif_metadata(path: Path) -> dict:
     """Extrait les métadonnées EXIF sans exiger le décodage complet des pixels."""
     out = {
-        "exif_datetime_original": None, "exif_datetime_digitized": None,
-        "exif_subsec_original": None, "exif_camera_make": None,
-        "exif_camera_model": None, "exif_camera_serial": None,
-        "exif_software": None, "exif_image_unique_id": None,
-        "exif_full_width": None, "exif_full_height": None,
+        "exif_datetime_original": None,
+        "exif_datetime_digitized": None,
+        "exif_subsec_original": None,
+        "exif_camera_make": None,
+        "exif_camera_model": None,
+        "exif_camera_serial": None,
+        "exif_software": None,
+        "exif_image_unique_id": None,
+        "exif_full_width": None,
+        "exif_full_height": None,
         "has_embedded_thumbnail": False,
         "embedded_thumbnail_offset_in_file": None,
         "embedded_thumbnail_length": None,
@@ -499,21 +564,29 @@ def extract_exif_metadata(path: Path) -> dict:
             exif = im.getexif()
             if not exif:
                 return out
-            out["exif_datetime_original"] = exif.get(_EXIF_TAG_DATETIME_ORIGINAL) or exif.get(_EXIF_TAG_DATETIME)
+            out["exif_datetime_original"] = exif.get(
+                _EXIF_TAG_DATETIME_ORIGINAL
+            ) or exif.get(_EXIF_TAG_DATETIME)
             out["exif_datetime_digitized"] = exif.get(_EXIF_TAG_DATETIME_DIGITIZED)
-            out["exif_subsec_original"] = _clean_exif_str(exif.get(_EXIF_TAG_SUBSEC_ORIGINAL))
+            out["exif_subsec_original"] = _clean_exif_str(
+                exif.get(_EXIF_TAG_SUBSEC_ORIGINAL)
+            )
             out["exif_camera_make"] = _clean_exif_str(exif.get(_EXIF_TAG_MAKE))
             out["exif_camera_model"] = _clean_exif_str(exif.get(_EXIF_TAG_MODEL))
             out["exif_camera_serial"] = _clean_exif_str(exif.get(_EXIF_TAG_SERIAL))
             out["exif_software"] = _clean_exif_str(exif.get(_EXIF_TAG_SOFTWARE))
-            out["exif_image_unique_id"] = _clean_exif_str(exif.get(_EXIF_TAG_ORIG_FILENAME))
+            out["exif_image_unique_id"] = _clean_exif_str(
+                exif.get(_EXIF_TAG_ORIG_FILENAME)
+            )
             try:
                 exif_ifd = exif.get_ifd(0x8769)
                 if exif_ifd:
-                    out["exif_full_width"] = (exif_ifd.get(_EXIF_TAG_PIXEL_X_DIMENSION)
-                                              or exif_ifd.get(_EXIF_TAG_IMAGE_WIDTH))
-                    out["exif_full_height"] = (exif_ifd.get(_EXIF_TAG_PIXEL_Y_DIMENSION)
-                                               or exif_ifd.get(_EXIF_TAG_IMAGE_HEIGHT))
+                    out["exif_full_width"] = exif_ifd.get(
+                        _EXIF_TAG_PIXEL_X_DIMENSION
+                    ) or exif_ifd.get(_EXIF_TAG_IMAGE_WIDTH)
+                    out["exif_full_height"] = exif_ifd.get(
+                        _EXIF_TAG_PIXEL_Y_DIMENSION
+                    ) or exif_ifd.get(_EXIF_TAG_IMAGE_HEIGHT)
             except Exception:
                 pass
             # Pillow ne garantit pas l'accès à l'IFD1 via get_ifd ; cette
@@ -533,8 +606,13 @@ def extract_exif_metadata(path: Path) -> dict:
     return out
 
 
-def classify_jpeg_role(carved_size: int, dims_header: Optional[tuple], exif: dict,
-                       thumbnail_max_dim: int = 640, thumbnail_max_bytes: int = 64 * 1024) -> str:
+def classify_jpeg_role(
+    carved_size: int,
+    dims_header: Optional[tuple],
+    exif: dict,
+    thumbnail_max_dim: int = 640,
+    thumbnail_max_bytes: int = 64 * 1024,
+) -> str:
     """Classe le JPEG avec une priorité forte au rappel des originaux.
 
     « likely_thumbnail » est volontairement attribué avec prudence : les JPEG
@@ -543,6 +621,7 @@ def classify_jpeg_role(carved_size: int, dims_header: Optional[tuple], exif: dic
     dimensions EXIF pleine taille et les dimensions du flux sont les meilleurs
     indices disponibles sans comparaison visuelle ni analyse du système de fichiers.
     """
+
     def positive_int(value: object) -> Optional[int]:
         """Convertit une valeur en entier strictement positif, sinon None."""
         try:
@@ -576,9 +655,14 @@ def classify_jpeg_role(carved_size: int, dims_header: Optional[tuple], exif: dic
     # pixels et dimensions. Un seul critère faible ne suffit plus.
     if valid_dims:
         very_small = max_dim <= 320 and carved_size <= 128 * 1024 and pixels <= 100_000
-        small_thumbnail = (max_dim <= thumbnail_max_dim and carved_size <= thumbnail_max_bytes
-                           and pixels <= 300_000)
-        compact_thumbnail = (max_dim <= 800 and carved_size <= 48 * 1024 and pixels <= 250_000)
+        small_thumbnail = (
+            max_dim <= thumbnail_max_dim
+            and carved_size <= thumbnail_max_bytes
+            and pixels <= 300_000
+        )
+        compact_thumbnail = (
+            max_dim <= 800 and carved_size <= 48 * 1024 and pixels <= 250_000
+        )
         if very_small or small_thumbnail or compact_thumbnail:
             return "likely_thumbnail"
 
@@ -598,21 +682,30 @@ def classify_jpeg_role(carved_size: int, dims_header: Optional[tuple], exif: dic
     return "unknown"
 
 
-def link_thumbnails_to_candidates(records: list[dict], max_distance: int = 64 * MIB) -> None:
+def link_thumbnails_to_candidates(
+    records: list[dict], max_distance: int = 64 * MIB
+) -> None:
     """Relie les vignettes aux candidats JPEG voisins et identifie les originaux validés.
 
     Le rapprochement est indicatif : proximité physique et métadonnées EXIF ne prouvent
     pas à elles seules que deux images représentent la même prise de vue.
     """
-    jpgs = sorted((r for r in records if r.get("type") == "jpg"),
-                  key=lambda r: r.get("offset_decimal", 0))
+    jpgs = sorted(
+        (r for r in records if r.get("type") == "jpg"),
+        key=lambda r: r.get("offset_decimal", 0),
+    )
     offsets = [r.get("offset_decimal", 0) for r in jpgs]
-    valid_originals = [r for r in jpgs if r.get("validation") == "valid"
-                       and r.get("jpeg_role") == "likely_original"]
+    valid_originals = [
+        r
+        for r in jpgs
+        if r.get("validation") == "valid" and r.get("jpeg_role") == "likely_original"
+    ]
     valid_original_offsets = [r.get("offset_decimal", 0) for r in valid_originals]
 
     for rec in jpgs:
-        rec["linked_candidate_offsets_hex"] = rec.get("linked_candidate_offsets_hex") or []
+        rec["linked_candidate_offsets_hex"] = (
+            rec.get("linked_candidate_offsets_hex") or []
+        )
         rec["linked_candidate_count"] = rec.get("linked_candidate_count", 0)
         rec["linked_validated_original_offsets_hex"] = []
         rec["linked_validated_original_count"] = 0
@@ -622,8 +715,12 @@ def link_thumbnails_to_candidates(records: list[dict], max_distance: int = 64 * 
         center = rec.get("offset_decimal", 0)
         lo = bisect.bisect_left(offsets, center - max_distance)
         hi = bisect.bisect_right(offsets, center + max_distance)
-        nearby = [jpgs[j] for j in range(lo, hi)
-                  if jpgs[j] is not rec and jpgs[j].get("jpeg_role") in ("likely_original", "unknown")]
+        nearby = [
+            jpgs[j]
+            for j in range(lo, hi)
+            if jpgs[j] is not rec
+            and jpgs[j].get("jpeg_role") in ("likely_original", "unknown")
+        ]
         nearby.sort(key=lambda c: abs(c.get("offset_decimal", 0) - center))
         rec["linked_candidate_offsets_hex"] = [c.get("offset_hex") for c in nearby[:20]]
         rec["linked_candidate_count"] = len(nearby)
@@ -650,8 +747,9 @@ def link_thumbnails_to_candidates(records: list[dict], max_distance: int = 64 * 
             cand_w, cand_h = candidate.get("width"), candidate.get("height")
             if full_w and full_h and cand_w and cand_h:
                 try:
-                    if abs(int(full_w) - int(cand_w)) <= max(16, int(cand_w) * 0.03) and \
-                       abs(int(full_h) - int(cand_h)) <= max(16, int(cand_h) * 0.03):
+                    if abs(int(full_w) - int(cand_w)) <= max(
+                        16, int(cand_w) * 0.03
+                    ) and abs(int(full_h) - int(cand_h)) <= max(16, int(cand_h) * 0.03):
                         return True
                 except (TypeError, ValueError, OverflowError):
                     pass
@@ -659,7 +757,9 @@ def link_thumbnails_to_candidates(records: list[dict], max_distance: int = 64 * 
 
         linked_valid = [c for c in nearby_valid if has_matching_evidence(c)]
         linked_valid.sort(key=lambda c: abs(c.get("offset_decimal", 0) - center))
-        rec["linked_validated_original_offsets_hex"] = [c.get("offset_hex") for c in linked_valid[:20]]
+        rec["linked_validated_original_offsets_hex"] = [
+            c.get("offset_hex") for c in linked_valid[:20]
+        ]
         rec["linked_validated_original_count"] = len(linked_valid)
         rec["has_validated_original_association"] = bool(linked_valid)
 
@@ -668,11 +768,18 @@ def link_thumbnails_to_candidates(records: list[dict], max_distance: int = 64 * 
 # Validation / réparation Pillow (optionnelles — jamais requises)
 # --------------------------------------------------------------------------- #
 
+
 def image_validate(path: Path) -> dict:
     try:
         from PIL import Image
     except ImportError:
-        return {"validation": "pillow_missing", "width": None, "height": None, "exif_date": None, "error": "Pillow absent"}
+        return {
+            "validation": "pillow_missing",
+            "width": None,
+            "height": None,
+            "exif_date": None,
+            "error": "Pillow absent",
+        }
     try:
         with Image.open(path) as im:
             fmt = im.format
@@ -686,9 +793,22 @@ def image_validate(path: Path) -> dict:
             im.verify()
         with Image.open(path) as im:
             im.load()
-        return {"validation": "valid", "width": width, "height": height, "format": fmt, "exif_date": exif_date, "error": None}
+        return {
+            "validation": "valid",
+            "width": width,
+            "height": height,
+            "format": fmt,
+            "exif_date": exif_date,
+            "error": None,
+        }
     except Exception as e:
-        return {"validation": "invalid", "width": None, "height": None, "exif_date": None, "error": str(e)[:300]}
+        return {
+            "validation": "invalid",
+            "width": None,
+            "height": None,
+            "exif_date": None,
+            "error": str(e)[:300],
+        }
 
 
 def try_repair(source: Path, output: Path) -> tuple[bool, Optional[str]]:
@@ -716,22 +836,30 @@ def try_repair(source: Path, output: Path) -> tuple[bool, Optional[str]]:
         ImageFile.LOAD_TRUNCATED_IMAGES = old
 
 
-def make_contact_sheet(records: list[dict], dest: Path, thumb_size=(180, 135), per_sheet=120) -> list[str]:
+def make_contact_sheet(
+    records: list[dict], dest: Path, thumb_size=(180, 135), per_sheet=120
+) -> list[str]:
     try:
         from PIL import Image, ImageDraw
     except ImportError:
         return []
     paths = [
-        dest / r["file"] for r in records
-        if r.get("saved", True) is not False and r.get("type") in ("jpg", "png", "gif", "bmp")
+        dest / r["file"]
+        for r in records
+        if r.get("saved", True) is not False
+        and r.get("type") in ("jpg", "png", "gif", "bmp")
         and r.get("validation") in ("valid", "partial_repair_possible")
     ]
     outputs: list[str] = []
     for batchno in range(0, len(paths), per_sheet):
-        batch = paths[batchno:batchno + per_sheet]
+        batch = paths[batchno : batchno + per_sheet]
         cols = 6
         cellw, cellh = 200, 170
-        sheet = Image.new("RGB", (cols * cellw, ((len(batch) + cols - 1) // cols) * cellh), (245, 245, 245))
+        sheet = Image.new(
+            "RGB",
+            (cols * cellw, ((len(batch) + cols - 1) // cols) * cellh),
+            (245, 245, 245),
+        )
         draw = ImageDraw.Draw(sheet)
         for i, p in enumerate(batch):
             try:
@@ -740,7 +868,11 @@ def make_contact_sheet(records: list[dict], dest: Path, thumb_size=(180, 135), p
                     x = (i % cols) * cellw + (cellw - im.width) // 2
                     y = (i // cols) * cellh + 4
                     sheet.paste(im, (x, y))
-                    draw.text(((i % cols) * cellw + 5, (i // cols) * cellh + 143), p.name[:28], fill=(20, 20, 20))
+                    draw.text(
+                        ((i % cols) * cellw + 5, (i // cols) * cellh + 143),
+                        p.name[:28],
+                        fill=(20, 20, 20),
+                    )
             except Exception as e:
                 log.debug("Vignette ignorée pour %s : %s", p.name, e)
         out = dest / f"planche_contact_{batchno // per_sheet + 1:03d}.jpg"
@@ -753,6 +885,7 @@ def make_contact_sheet(records: list[dict], dest: Path, thumb_size=(180, 135), p
 # État du run (pour --resume et le résumé final)
 # --------------------------------------------------------------------------- #
 
+
 @dataclass
 class RunStats:
     extracted: int = 0
@@ -761,7 +894,9 @@ class RunStats:
     counts: dict = field(default_factory=dict)
 
 
-def load_existing_manifest(manifest_path: Path) -> tuple[list[dict], set[int], set[str]]:
+def load_existing_manifest(
+    manifest_path: Path,
+) -> tuple[list[dict], set[int], set[str]]:
     """Relit un manifeste existant pour une reprise : renvoie les enregistrements,
     les offsets de début déjà couverts et les hashes déjà vus (dédup)."""
     records: list[dict] = []
@@ -786,10 +921,10 @@ def load_existing_manifest(manifest_path: Path) -> tuple[list[dict], set[int], s
     return records, covered_starts, seen_hashes
 
 
-
 # --------------------------------------------------------------------------- #
 # Analyse sommaire FAT/exFAT (lecture seule)
 # --------------------------------------------------------------------------- #
+
 
 @dataclass
 class FatInfo:
@@ -827,8 +962,20 @@ def parse_fat_boot_sector(f) -> Optional[FatInfo]:
             return None
         if not bps or not spc:
             return None
-        return FatInfo("exFAT", bps, spc, bps * spc, fat_offset, num_fats,
-                       fat_length, root_cluster, heap_offset * bps, total_sectors, None, warnings)
+        return FatInfo(
+            "exFAT",
+            bps,
+            spc,
+            bps * spc,
+            fat_offset,
+            num_fats,
+            fat_length,
+            root_cluster,
+            heap_offset * bps,
+            total_sectors,
+            None,
+            warnings,
+        )
     try:
         bps = struct.unpack_from("<H", boot, 11)[0]
         spc = boot[13]
@@ -861,8 +1008,20 @@ def parse_fat_boot_sector(f) -> Optional[FatInfo]:
         label = boot[71:82].decode("ascii", errors="replace").strip()
     if not fatsz or data_sector <= 0:
         warnings.append("Paramètres BPB incohérents.")
-    return FatInfo(fs_type, bps, spc, bps * spc, reserved, num_fats, fatsz,
-                   root_cluster, data_sector * bps, total, label or None, warnings)
+    return FatInfo(
+        fs_type,
+        bps,
+        spc,
+        bps * spc,
+        reserved,
+        num_fats,
+        fatsz,
+        root_cluster,
+        data_sector * bps,
+        total,
+        label or None,
+        warnings,
+    )
 
 
 def analyze_filesystem(src: Path) -> Optional[FatInfo]:
@@ -870,51 +1029,121 @@ def analyze_filesystem(src: Path) -> Optional[FatInfo]:
         return parse_fat_boot_sector(f)
 
 
-def cross_reference_candidates_with_clusters(records: list[dict], info: FatInfo) -> None:
+def cross_reference_candidates_with_clusters(
+    records: list[dict], info: FatInfo
+) -> None:
     if not info.cluster_size_bytes:
         return
     for rec in records:
         offset = rec.get("offset_decimal")
-        rec["fat_cluster"] = (None if offset is None or offset < info.data_start_offset else
-                              2 + (offset - info.data_start_offset) // info.cluster_size_bytes)
+        rec["fat_cluster"] = (
+            None
+            if offset is None or offset < info.data_start_offset
+            else 2 + (offset - info.data_start_offset) // info.cluster_size_bytes
+        )
 
 
 # --------------------------------------------------------------------------- #
 # Programme principal
 # --------------------------------------------------------------------------- #
 
+
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Carving prudent depuis un .img existant (source en lecture seule).")
+    p = argparse.ArgumentParser(
+        description="Carving prudent depuis un .img existant (source en lecture seule)."
+    )
     p.add_argument("image", type=Path, help="Fichier .img/.dd/.raw existant")
     p.add_argument("-o", "--output", type=Path, default=None)
-    p.add_argument("-j", "--workers", type=int, default=max(1, min(12, os.cpu_count() or 1)))
+    p.add_argument(
+        "-j", "--workers", type=int, default=max(1, min(12, os.cpu_count() or 1))
+    )
     p.add_argument("--chunk-mib", type=int, default=64)
-    p.add_argument("--min-size", type=int, default=1024, help="Taille minimale d'un fichier extrait (octets; défaut 1024)")
-    p.add_argument("--max-files", type=int, default=0, help="Limite d'extractions (0=illimité)")
-    p.add_argument("--no-repair", action="store_true", help="Ne pas tenter de réparer les JPEG invalides/tronqués")
-    p.add_argument("--analyze-fat", action="store_true",
-                   help="Analyse préliminaire du secteur de boot FAT/exFAT et annote les candidats (lecture seule)")
-    p.add_argument("--no-contact-sheet", action="store_true", help="Ne pas créer de planches-contact")
-    p.add_argument("--no-dedup", action="store_true", help="Ne pas dédupliquer par hash SHA-256 (conserve tous les doublons)")
-    p.add_argument("--resume", action="store_true", help="Reprendre un run existant à partir du manifeste JSONL")
-    p.add_argument("--dry-run", action="store_true", help="Estimation rapide des candidats, sans extraction ni validation complète")
-    p.add_argument("--analyze-only", "--analyse-seule", dest="analyze_only", action="store_true",
-                   help="Analyse complète sans conserver les photos : affiche les compteurs puis supprime les fichiers temporaires")
-    p.add_argument("--exclude-thumbnails", "--sans-miniatures", dest="exclude_thumbnails", action="store_true",
-                   help="Ne pas sauvegarder les JPEG classés comme miniatures probables ; ils restent dans le rapport")
-    p.add_argument("--formats", type=str, default="jpg,png,gif,bmp,pdf",
-                    help="Sous-ensemble de formats à rechercher, séparés par des virgules (défaut: tous)")
-    p.add_argument("--header-scan-mib", type=int, default=8,
-                    help="Fenêtre de recherche du marqueur SOF dans l'en-tête JPEG, en Mio (défaut 8 ; "
-                         "augmenter si des photos de smartphone/drone à gros bloc EXIF/thumbnail/ICC "
-                         "sont rejetées)")
-    p.add_argument("--salvage-min-kib", type=int, default=4,
-                    help="Taille minimale, en Kio, d'un JPEG tronqué sauvé sans marqueur de fin (défaut 4)")
-    p.add_argument("--salvage-max-mib", type=int, default=64,
-                    help="Taille maximale, en Mio, d'un JPEG tronqué sauvé sans marqueur de fin (défaut 64 ; "
-                         "augmenter pour des photos haute résolution récentes, 20+ Mpx)")
-    p.add_argument("-v", "--verbose", action="store_true", help="Journalisation détaillée (DEBUG)")
-    p.add_argument("-q", "--quiet", action="store_true", help="Réduit la sortie au strict résumé")
+    p.add_argument(
+        "--min-size",
+        type=int,
+        default=1024,
+        help="Taille minimale d'un fichier extrait (octets; défaut 1024)",
+    )
+    p.add_argument(
+        "--max-files", type=int, default=0, help="Limite d'extractions (0=illimité)"
+    )
+    p.add_argument(
+        "--no-repair",
+        action="store_true",
+        help="Ne pas tenter de réparer les JPEG invalides/tronqués",
+    )
+    p.add_argument(
+        "--analyze-fat",
+        action="store_true",
+        help="Analyse préliminaire du secteur de boot FAT/exFAT et annote les candidats (lecture seule)",
+    )
+    p.add_argument(
+        "--no-contact-sheet",
+        action="store_true",
+        help="Ne pas créer de planches-contact",
+    )
+    p.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="Ne pas dédupliquer par hash SHA-256 (conserve tous les doublons)",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reprendre un run existant à partir du manifeste JSONL",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Estimation rapide des candidats, sans extraction ni validation complète",
+    )
+    p.add_argument(
+        "--analyze-only",
+        "--analyse-seule",
+        dest="analyze_only",
+        action="store_true",
+        help="Analyse complète sans conserver les photos : affiche les compteurs puis supprime les fichiers temporaires",
+    )
+    p.add_argument(
+        "--exclude-thumbnails",
+        "--sans-miniatures",
+        dest="exclude_thumbnails",
+        action="store_true",
+        help="Ne pas sauvegarder les JPEG classés comme miniatures probables ; ils restent dans le rapport",
+    )
+    p.add_argument(
+        "--formats",
+        type=str,
+        default="jpg,png,gif,bmp,pdf",
+        help="Sous-ensemble de formats à rechercher, séparés par des virgules (défaut: tous)",
+    )
+    p.add_argument(
+        "--header-scan-mib",
+        type=int,
+        default=8,
+        help="Fenêtre de recherche du marqueur SOF dans l'en-tête JPEG, en Mio (défaut 8 ; "
+        "augmenter si des photos de smartphone/drone à gros bloc EXIF/thumbnail/ICC "
+        "sont rejetées)",
+    )
+    p.add_argument(
+        "--salvage-min-kib",
+        type=int,
+        default=4,
+        help="Taille minimale, en Kio, d'un JPEG tronqué sauvé sans marqueur de fin (défaut 4)",
+    )
+    p.add_argument(
+        "--salvage-max-mib",
+        type=int,
+        default=64,
+        help="Taille maximale, en Mio, d'un JPEG tronqué sauvé sans marqueur de fin (défaut 64 ; "
+        "augmenter pour des photos haute résolution récentes, 20+ Mpx)",
+    )
+    p.add_argument(
+        "-v", "--verbose", action="store_true", help="Journalisation détaillée (DEBUG)"
+    )
+    p.add_argument(
+        "-q", "--quiet", action="store_true", help="Réduit la sortie au strict résumé"
+    )
     return p
 
 
@@ -932,7 +1161,9 @@ def configure_logging(dest: Optional[Path], verbose: bool, quiet: bool) -> None:
         dest.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(dest / "recup_after.log", encoding="utf-8")
         file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
         log.addHandler(file_handler)
 
 
@@ -947,7 +1178,9 @@ def hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[Path, Path, set[str]]:
+def validate_args(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> tuple[Path, Path, set[str]]:
     src = args.image.expanduser().resolve()
     if not src.is_file():
         parser.error(f"Image introuvable : {src}")
@@ -958,7 +1191,9 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     if args.min_size < 0 or args.max_files < 0:
         parser.error("--min-size et --max-files doivent être positifs")
     if args.dry_run and args.analyze_only:
-        parser.error("--dry-run et --analyze-only sont deux modes différents ; choisissez-en un seul.")
+        parser.error(
+            "--dry-run et --analyze-only sont deux modes différents ; choisissez-en un seul."
+        )
     if args.analyze_only and args.resume:
         parser.error("--resume ne s'applique pas à --analyze-only.")
 
@@ -966,22 +1201,38 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     valid_formats = {ext for ext, _ in SIGNATURES}
     unknown = formats - valid_formats
     if unknown:
-        parser.error(f"Formats inconnus : {', '.join(sorted(unknown))} (valides : {', '.join(sorted(valid_formats))})")
+        parser.error(
+            f"Formats inconnus : {', '.join(sorted(unknown))} (valides : {', '.join(sorted(valid_formats))})"
+        )
     if not formats:
         parser.error("--formats ne peut pas être vide")
 
-    dest = (args.output or src.with_name(src.stem + "_recuperation")).expanduser().resolve()
+    dest = (
+        (args.output or src.with_name(src.stem + "_recuperation"))
+        .expanduser()
+        .resolve()
+    )
     if dest == src or dest in src.parents or src in dest.parents and dest != src:
         pass  # dest sous src est impossible puisque src est un fichier ; garde ci-dessous suffit
     if dest == src or src in (dest, *dest.parents):
         parser.error("Le dossier de sortie ne peut pas être l'image elle-même.")
     if dest in src.parents:
-        parser.error("Le dossier de sortie ne peut pas être un dossier parent de l'image.")
+        parser.error(
+            "Le dossier de sortie ne peut pas être un dossier parent de l'image."
+        )
     if dest.exists() and dest.is_file():
         parser.error("Le chemin de sortie existe et n'est pas un dossier.")
-    if dest.exists() and any(dest.iterdir()) and not args.resume and not args.dry_run and not args.analyze_only:
-        parser.error(f"Le dossier de sortie {dest} existe déjà et n'est pas vide. Utilisez --resume pour reprendre, "
-                      f"ou choisissez un autre --output.")
+    if (
+        dest.exists()
+        and any(dest.iterdir())
+        and not args.resume
+        and not args.dry_run
+        and not args.analyze_only
+    ):
+        parser.error(
+            f"Le dossier de sortie {dest} existe déjà et n'est pas vide. Utilisez --resume pour reprendre, "
+            f"ou choisissez un autre --output."
+        )
     return src, dest, formats
 
 
@@ -994,17 +1245,26 @@ def main() -> int:
     except SystemExit:
         raise
 
-    configure_logging(None if (args.dry_run or args.analyze_only) else dest, args.verbose, args.quiet)
+    configure_logging(
+        None if (args.dry_run or args.analyze_only) else dest, args.verbose, args.quiet
+    )
 
     log.info("=" * 68)
     log.info("CARVING PRUDENT — SOURCE EN LECTURE SEULE")
     log.info("=" * 68)
-    log.info("Formats recherchés : %s. Validation Pillow facultative.", ", ".join(sorted(formats)))
+    log.info(
+        "Formats recherchés : %s. Validation Pillow facultative.",
+        ", ".join(sorted(formats)),
+    )
     if args.analyze_only:
         log.info("Mode analyse seul : les photos ne seront pas sauvegardées.")
     else:
-        log.info("Les originaux extraits sont conservés ; les réparations sont séparées.")
-    log.info("Note : les fichiers fragmentés ne peuvent pas toujours être reconstruits.")
+        log.info(
+            "Les originaux extraits sont conservés ; les réparations sont séparées."
+        )
+    log.info(
+        "Note : les fichiers fragmentés ne peuvent pas toujours être reconstruits."
+    )
 
     if not args.dry_run and not args.analyze_only:
         dest.mkdir(parents=True, exist_ok=True)
@@ -1022,7 +1282,9 @@ def main() -> int:
         sys.stdout.flush()
 
     try:
-        candidates, image_size = scan_signatures(src, args.workers, args.chunk_mib * MIB, progress_cb=progress)
+        candidates, image_size = scan_signatures(
+            src, args.workers, args.chunk_mib * MIB, progress_cb=progress
+        )
     except RecupError as e:
         print()
         log.error("Échec du scan : %s", e)
@@ -1042,11 +1304,17 @@ def main() -> int:
     if args.analyze_fat:
         fat_info = analyze_filesystem(src)
         if fat_info is None:
-            log.warning("--analyze-fat : aucun secteur de boot FAT/exFAT valide trouvé en tête d'image "
-                        "(possible si l'image commence par une table MBR/GPT).")
+            log.warning(
+                "--analyze-fat : aucun secteur de boot FAT/exFAT valide trouvé en tête d'image "
+                "(possible si l'image commence par une table MBR/GPT)."
+            )
         else:
-            log.info("Système de fichiers détecté : %s | cluster : %d octets | zone de données : %#x",
-                     fat_info.fs_type, fat_info.cluster_size_bytes, fat_info.data_start_offset)
+            log.info(
+                "Système de fichiers détecté : %s | cluster : %d octets | zone de données : %#x",
+                fat_info.fs_type,
+                fat_info.cluster_size_bytes,
+                fat_info.data_start_offset,
+            )
             for warning in fat_info.warnings:
                 log.warning("FAT : %s", warning)
 
@@ -1054,9 +1322,14 @@ def main() -> int:
     if args.analyze_only:
         photo_formats = {"jpg", "png", "gif", "bmp"}
         candidates = [c for c in candidates if c[1] in photo_formats]
-        log.info("Mode analyse : les fichiers non-images (ex. PDF) ne seront pas extraits ni analysés.")
-    log.info("Signatures candidates : %d (après filtre --formats%s)", len(candidates),
-             " et formats photo" if args.analyze_only else "")
+        log.info(
+            "Mode analyse : les fichiers non-images (ex. PDF) ne seront pas extraits ni analysés."
+        )
+    log.info(
+        "Signatures candidates : %d (après filtre --formats%s)",
+        len(candidates),
+        " et formats photo" if args.analyze_only else "",
+    )
 
     jpg_offsets = [o for o, e in candidates if e == "jpg"]
     manifest_path = dest / "manifest.jsonl"
@@ -1084,19 +1357,31 @@ def main() -> int:
     if args.resume and not args.dry_run and not args.analyze_only:
         records, covered_starts, seen_hashes = load_existing_manifest(manifest_path)
         for r in records:
-            if args.exclude_thumbnails and r.get("type") == "jpg" and r.get("jpeg_role") == "likely_thumbnail":
+            if (
+                args.exclude_thumbnails
+                and r.get("type") == "jpg"
+                and r.get("jpeg_role") == "likely_thumbnail"
+            ):
                 old_file = r.get("file")
                 if old_file and r.get("saved", True) is not False:
                     try:
                         (dest / old_file).unlink(missing_ok=True)
                     except OSError as e:
-                        log.warning("Impossible de supprimer la miniature existante %s : %s", old_file, e)
+                        log.warning(
+                            "Impossible de supprimer la miniature existante %s : %s",
+                            old_file,
+                            e,
+                        )
                 repair_file = r.get("repair_file")
                 if repair_file:
                     try:
                         (dest / repair_file).unlink(missing_ok=True)
                     except OSError as e:
-                        log.warning("Impossible de supprimer la réparation associée à la miniature %s : %s", old_file, e)
+                        log.warning(
+                            "Impossible de supprimer la réparation associée à la miniature %s : %s",
+                            old_file,
+                            e,
+                        )
                 r["repair_created"] = False
                 r["repair_file"] = None
                 r["saved"] = False
@@ -1115,7 +1400,10 @@ def main() -> int:
         for r in records:
             stats.counts[r["type"]] = stats.counts.get(r["type"], 0) + 1
         stats.extracted = sum(r.get("saved", True) is not False for r in records)
-        log.info("Reprise : %d fichiers déjà sauvegardés dans un run précédent, conservés tels quels.", stats.extracted)
+        log.info(
+            "Reprise : %d fichiers déjà sauvegardés dans un run précédent, conservés tels quels.",
+            stats.extracted,
+        )
         manifest_mode = "a"
     else:
         manifest_mode = "w"
@@ -1134,7 +1422,9 @@ def main() -> int:
             if args.resume and offset in covered_starts:
                 continue
             if not args.quiet and (idx - last_progress >= 5000 or idx == total):
-                sys.stdout.write(f"\rExtraction/validation : {idx}/{total} ({100 * idx / max(1, total):.1f}%)")
+                sys.stdout.write(
+                    f"\rExtraction/validation : {idx}/{total} ({100 * idx / max(1, total):.1f}%)"
+                )
                 sys.stdout.flush()
                 last_progress = idx
 
@@ -1149,8 +1439,12 @@ def main() -> int:
             truncated = False
             dims = None
             if ext == "jpg":
-                dims = jpeg_dimensions(f, offset, min(image_size, offset + args.header_scan_mib * MIB),
-                                        args.header_scan_mib * MIB)
+                dims = jpeg_dimensions(
+                    f,
+                    offset,
+                    min(image_size, offset + args.header_scan_mib * MIB),
+                    args.header_scan_mib * MIB,
+                )
                 # Pas de SOF trouvé dans la fenêtre (en-tête EXIF/ICC/thumbnail
                 # anormalement volumineux, ou JPEG progressif atypique) : on ne
                 # rejette plus à l'aveugle. Un vrai en-tête \xff\xd8\xff a déjà
@@ -1158,12 +1452,19 @@ def main() -> int:
                 # juge de la validité finale plutôt que de perdre le fichier ici.
                 j = bisect.bisect_right(jpg_offsets, offset)
                 next_jpg = jpg_offsets[j] if j < len(jpg_offsets) else None
-                length, kind = jpeg_length(f, offset, image_size, next_jpg, not args.no_repair,
-                                            args.salvage_min_kib * 1024, args.salvage_max_mib * MIB)
+                length, kind = jpeg_length(
+                    f,
+                    offset,
+                    image_size,
+                    next_jpg,
+                    not args.no_repair,
+                    args.salvage_min_kib * 1024,
+                    args.salvage_max_mib * MIB,
+                )
                 if length is None:
                     stats.rejected += 1
                     continue
-                truncated = (kind == "truncated")
+                truncated = kind == "truncated"
             elif ext == "png":
                 length = png_length(f, offset, image_size)
             elif ext == "gif":
@@ -1194,7 +1495,11 @@ def main() -> int:
 
             stats.counts[ext] = stats.counts.get(ext, 0) + 1
             name = f"recup_{ext}_{stats.counts[ext]:06d}_offset_{offset:012x}.{ext}"
-            out = (temp_output_dir / name) if args.analyze_only and temp_output_dir is not None else dest / name
+            out = (
+                (temp_output_dir / name)
+                if args.analyze_only and temp_output_dir is not None
+                else dest / name
+            )
             try:
                 with open(out, "xb", buffering=0) as of:
                     f.seek(offset)
@@ -1237,43 +1542,77 @@ def main() -> int:
                 rec.update(val)
                 if truncated and val.get("validation") != "valid":
                     rec["validation"] = "partial_repair_possible"
-                if ext == "jpg" and val.get("validation") != "valid" and not args.no_repair and not args.analyze_only:
+                if (
+                    ext == "jpg"
+                    and val.get("validation") != "valid"
+                    and not args.no_repair
+                    and not args.analyze_only
+                ):
                     repair_dir = dest / "reparations"
                     repair_path = repair_dir / (out.stem + "_repare.jpg")
                     ok, err = try_repair(out, repair_path)
                     rec["repair_created"] = ok
-                    rec["repair_file"] = str(Path("reparations") / repair_path.name) if ok else None
+                    rec["repair_file"] = (
+                        str(Path("reparations") / repair_path.name) if ok else None
+                    )
                     rec["repair_error"] = err
                 if ext == "jpg":
                     exif_meta = extract_exif_metadata(out)
                     rec.update(exif_meta)
                     rec["jpeg_role"] = classify_jpeg_role(length, dims, exif_meta)
                 else:
-                    rec.update({
-                        "exif_datetime_original": None, "exif_datetime_digitized": None,
-                        "exif_subsec_original": None, "exif_camera_make": None,
-                        "exif_camera_model": None, "exif_camera_serial": None,
-                        "exif_software": None, "exif_image_unique_id": None,
-                        "exif_full_width": None, "exif_full_height": None,
+                    rec.update(
+                        {
+                            "exif_datetime_original": None,
+                            "exif_datetime_digitized": None,
+                            "exif_subsec_original": None,
+                            "exif_camera_make": None,
+                            "exif_camera_model": None,
+                            "exif_camera_serial": None,
+                            "exif_software": None,
+                            "exif_image_unique_id": None,
+                            "exif_full_width": None,
+                            "exif_full_height": None,
+                            "has_embedded_thumbnail": False,
+                            "embedded_thumbnail_offset_in_file": None,
+                            "embedded_thumbnail_length": None,
+                            "jpeg_role": "not_applicable",
+                        }
+                    )
+            else:
+                rec.update(
+                    {
+                        "validation": "not_applicable",
+                        "width": None,
+                        "height": None,
+                        "exif_date": None,
+                        "error": None,
+                    }
+                )
+                rec.update(
+                    {
+                        "exif_datetime_original": None,
+                        "exif_datetime_digitized": None,
+                        "exif_subsec_original": None,
+                        "exif_camera_make": None,
+                        "exif_camera_model": None,
+                        "exif_camera_serial": None,
+                        "exif_software": None,
+                        "exif_image_unique_id": None,
+                        "exif_full_width": None,
+                        "exif_full_height": None,
                         "has_embedded_thumbnail": False,
                         "embedded_thumbnail_offset_in_file": None,
-                        "embedded_thumbnail_length": None, "jpeg_role": "not_applicable",
-                    })
-            else:
-                rec.update({"validation": "not_applicable", "width": None, "height": None, "exif_date": None, "error": None})
-                rec.update({
-                    "exif_datetime_original": None, "exif_datetime_digitized": None,
-                    "exif_subsec_original": None, "exif_camera_make": None,
-                    "exif_camera_model": None, "exif_camera_serial": None,
-                    "exif_software": None, "exif_image_unique_id": None,
-                    "exif_full_width": None, "exif_full_height": None,
-                    "has_embedded_thumbnail": False,
-                    "embedded_thumbnail_offset_in_file": None,
-                    "embedded_thumbnail_length": None, "jpeg_role": "not_applicable",
-                })
+                        "embedded_thumbnail_length": None,
+                        "jpeg_role": "not_applicable",
+                    }
+                )
 
-            excluded_thumbnail = bool(args.exclude_thumbnails and ext == "jpg"
-                                      and rec.get("jpeg_role") == "likely_thumbnail")
+            excluded_thumbnail = bool(
+                args.exclude_thumbnails
+                and ext == "jpg"
+                and rec.get("jpeg_role") == "likely_thumbnail"
+            )
             if excluded_thumbnail:
                 # Le candidat est conservé dans le rapport, mais le fichier image et
                 # une éventuelle réparation associée ne sont pas conservés.
@@ -1329,7 +1668,12 @@ def main() -> int:
 
     if args.dry_run:
         log.info("--dry-run : aucun fichier écrit.")
-        log.info("Estimation : %d fichiers extractibles, %d rejetés, par type : %s", stats.extracted, stats.rejected, stats.counts)
+        log.info(
+            "Estimation : %d fichiers extractibles, %d rejetés, par type : %s",
+            stats.extracted,
+            stats.rejected,
+            stats.counts,
+        )
         log.info("Durée : %.1f s", time.time() - started)
         return 0
 
@@ -1340,16 +1684,30 @@ def main() -> int:
         photo_records = [r for r in records if r.get("type") in image_types]
         found = sum(1 for _, ext in candidates if ext in image_types)
         validated = sum(r.get("validation") == "valid" for r in photo_records)
-        originals_detected = sum(r.get("type") == "jpg" and r.get("jpeg_role") == "likely_original"
-                                 for r in photo_records)
-        originals_valid = sum(r.get("type") == "jpg" and r.get("validation") == "valid"
-                              and r.get("jpeg_role") == "likely_original" for r in photo_records)
-        thumbnails = sum(r.get("type") == "jpg" and r.get("jpeg_role") == "likely_thumbnail"
-                         for r in photo_records)
-        originals_invalid = sum(r.get("type") == "jpg" and r.get("jpeg_role") == "likely_original"
-                                and r.get("validation") != "valid" for r in photo_records)
-        unknown_jpegs = sum(r.get("type") == "jpg" and r.get("jpeg_role") == "unknown"
-                            for r in photo_records)
+        originals_detected = sum(
+            r.get("type") == "jpg" and r.get("jpeg_role") == "likely_original"
+            for r in photo_records
+        )
+        originals_valid = sum(
+            r.get("type") == "jpg"
+            and r.get("validation") == "valid"
+            and r.get("jpeg_role") == "likely_original"
+            for r in photo_records
+        )
+        thumbnails = sum(
+            r.get("type") == "jpg" and r.get("jpeg_role") == "likely_thumbnail"
+            for r in photo_records
+        )
+        originals_invalid = sum(
+            r.get("type") == "jpg"
+            and r.get("jpeg_role") == "likely_original"
+            and r.get("validation") != "valid"
+            for r in photo_records
+        )
+        unknown_jpegs = sum(
+            r.get("type") == "jpg" and r.get("jpeg_role") == "unknown"
+            for r in photo_records
+        )
         thumbnails_with_valid_original = sum(
             1
             for r in photo_records
@@ -1360,17 +1718,33 @@ def main() -> int:
         # Le résumé est le résultat principal de ce mode : il reste visible avec --quiet.
         log.warning("=" * 68)
         log.warning("RÉSUMÉ ANALYSE — AUCUNE PHOTO SAUVEGARDÉE")
-        log.warning("Signatures de fichiers photo trouvées (JPEG/PNG/GIF/BMP) : %d", found)
+        log.warning(
+            "Signatures de fichiers photo trouvées (JPEG/PNG/GIF/BMP) : %d", found
+        )
         log.warning("Photos validées par Pillow : %d", validated)
         log.warning("Originaux JPEG probables détectés : %d", originals_detected)
         log.warning("Originaux JPEG probables validés : %d", originals_valid)
         log.warning("Miniatures JPEG probables détectées : %d", thumbnails)
-        log.warning("JPEG au rôle incertain (conservés par prudence) : %d", unknown_jpegs)
-        log.warning("Originaux JPEG probables invalides ou non validés : %d", originals_invalid)
-        log.warning("Miniatures associées à au moins un original JPEG probable validé : %d", thumbnails_with_valid_original)
-        log.warning("Candidats photo non retenus au carving : %d", max(0, found - len(photo_records)))
-        log.warning("Les classements et associations sont heuristiques, pas des certitudes.")
-        log.warning("Fichiers temporaires supprimés ; aucun rapport ni photo écrit dans le dossier de sortie.")
+        log.warning(
+            "JPEG au rôle incertain (conservés par prudence) : %d", unknown_jpegs
+        )
+        log.warning(
+            "Originaux JPEG probables invalides ou non validés : %d", originals_invalid
+        )
+        log.warning(
+            "Miniatures associées à au moins un original JPEG probable validé : %d",
+            thumbnails_with_valid_original,
+        )
+        log.warning(
+            "Candidats photo non retenus au carving : %d",
+            max(0, found - len(photo_records)),
+        )
+        log.warning(
+            "Les classements et associations sont heuristiques, pas des certitudes."
+        )
+        log.warning(
+            "Fichiers temporaires supprimés ; aucun rapport ni photo écrit dans le dossier de sortie."
+        )
         log.warning("Durée totale : %.1f s", time.time() - started)
         return 0
     if fat_info is not None:
@@ -1383,15 +1757,44 @@ def main() -> int:
 
     # CSV détaillé
     csv_path = dest / "rapport_recuperation.csv"
-    fields = ["file", "type", "offset_hex", "offset_decimal", "size_bytes", "sha256", "validation",
-              "width", "height", "exif_date", "truncated_candidate", "repair_created", "repair_file", "error",
-              "jpeg_role", "exif_datetime_original", "exif_datetime_digitized", "exif_subsec_original",
-              "exif_camera_make", "exif_camera_model", "exif_camera_serial", "exif_software",
-              "exif_image_unique_id", "exif_full_width", "exif_full_height", "has_embedded_thumbnail",
-              "embedded_thumbnail_offset_in_file", "embedded_thumbnail_length",
-              "linked_candidate_count", "linked_candidate_offsets_hex", "linked_validated_original_count",
-              "linked_validated_original_offsets_hex", "has_validated_original_association", "saved",
-              "excluded_reason", "fat_cluster"]
+    fields = [
+        "file",
+        "type",
+        "offset_hex",
+        "offset_decimal",
+        "size_bytes",
+        "sha256",
+        "validation",
+        "width",
+        "height",
+        "exif_date",
+        "truncated_candidate",
+        "repair_created",
+        "repair_file",
+        "error",
+        "jpeg_role",
+        "exif_datetime_original",
+        "exif_datetime_digitized",
+        "exif_subsec_original",
+        "exif_camera_make",
+        "exif_camera_model",
+        "exif_camera_serial",
+        "exif_software",
+        "exif_image_unique_id",
+        "exif_full_width",
+        "exif_full_height",
+        "has_embedded_thumbnail",
+        "embedded_thumbnail_offset_in_file",
+        "embedded_thumbnail_length",
+        "linked_candidate_count",
+        "linked_candidate_offsets_hex",
+        "linked_validated_original_count",
+        "linked_validated_original_offsets_hex",
+        "has_validated_original_association",
+        "saved",
+        "excluded_reason",
+        "fat_cluster",
+    ]
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as cf:
         w = csv.DictWriter(cf, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
@@ -1414,9 +1817,13 @@ def main() -> int:
         "started_at": started,
         "finished_at": time.time(),
         "formats": sorted(formats),
-        "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+        "args": {
+            k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()
+        },
     }
-    (dest / "run_metadata.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    (dest / "run_metadata.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     # Rapport HTML local autonome
     # Rapport HTML trié par date EXIF connue, puis par offset physique.
@@ -1433,15 +1840,24 @@ def main() -> int:
         rep = html.escape(str(r.get("repair_file") or "—"))
         sha = html.escape(str(r.get("sha256", ""))[:12])
         role = str(r.get("jpeg_role") or "—")
-        role_html = (f'<span style="background:#fde68a;padding:1px 6px;border-radius:3px">{html.escape(role)}</span>'
-                     if role == "likely_thumbnail" else html.escape(role))
+        role_html = (
+            f'<span style="background:#fde68a;padding:1px 6px;border-radius:3px">{html.escape(role)}</span>'
+            if role == "likely_thumbnail"
+            else html.escape(role)
+        )
         exif_dt = html.escape(str(r.get("exif_datetime_original") or "—"))
         serial = html.escape(str(r.get("exif_camera_serial") or "—"))
         cluster = r.get("fat_cluster")
         cluster_s = f"#{cluster}" if cluster is not None else "—"
         linked = r.get("linked_candidate_offsets_hex") or []
-        linked_s = html.escape(", ".join(linked[:5]) +
-                               (f" (+{len(linked)-5})" if len(linked) > 5 else "")) if linked else "—"
+        linked_s = (
+            html.escape(
+                ", ".join(linked[:5])
+                + (f" (+{len(linked) - 5})" if len(linked) > 5 else "")
+            )
+            if linked
+            else "—"
+        )
         saved_s = "oui" if r.get("saved", True) else "non (miniature exclue)"
         assoc = "oui" if r.get("has_validated_original_association") else "—"
         rows.append(
@@ -1449,9 +1865,13 @@ def main() -> int:
             f"<td>{validation}</td><td>{role_html}</td><td>{exif_dt}</td><td>{serial}</td>"
             f"<td>{cluster_s}</td><td>{linked_s}</td><td>{assoc}</td><td>{saved_s}</td><td>{rep}</td><td>{sha}</td></tr>"
         )
-    sheet_html = "".join(
-        f'<p><a href="{html.escape(s)}">Planche-contact {html.escape(s)}</a></p>' for s in sheets
-    ) or "<p>Aucune planche-contact générée (Pillow absent ou option désactivée).</p>"
+    sheet_html = (
+        "".join(
+            f'<p><a href="{html.escape(s)}">Planche-contact {html.escape(s)}</a></p>'
+            for s in sheets
+        )
+        or "<p>Aucune planche-contact générée (Pillow absent ou option désactivée).</p>"
+    )
     html_path = dest / "rapport_recuperation.html"
     html_path.write_text(
         "<!doctype html><html lang='fr'><meta charset='utf-8'><title>Rapport de récupération</title>"
@@ -1463,9 +1883,10 @@ def main() -> int:
         f"réparations créées : {repaired} ; doublons écartés : {stats.duplicates} ; rejetés : {stats.rejected}</p>"
         + sheet_html
         + "<table><thead><tr><th>Fichier</th><th>Type</th><th>Taille</th><th>Dimensions</th>"
-          "<th>Validation</th><th>Rôle JPEG</th><th>Date EXIF prise de vue</th><th>N° série appareil</th>"
-          "<th>Cluster FAT</th><th>Candidats liés (offsets)</th><th>Original validé associé</th><th>Sauvegardé</th><th>Réparation</th><th>SHA-256</th></tr></thead><tbody>"
-        + "".join(rows) + "</tbody></table>"
+        "<th>Validation</th><th>Rôle JPEG</th><th>Date EXIF prise de vue</th><th>N° série appareil</th>"
+        "<th>Cluster FAT</th><th>Candidats liés (offsets)</th><th>Original validé associé</th><th>Sauvegardé</th><th>Réparation</th><th>SHA-256</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
         "<p style='margin-top:16px;color:#555'>Une ligne <b>likely_thumbnail</b> indique un JPEG probablement "
         "extrait comme vignette. Les offsets liés signalent les JPEG voisins à examiner ; ils ne prouvent pas "
         "qu'ils appartiennent à la même photo. L'analyse FAT est indicative et ne reconstruit pas les fichiers.</p></html>",
@@ -1479,20 +1900,38 @@ def main() -> int:
     log.info("Rapport HTML : %s", html_path)
     log.info("Rapport CSV : %s", csv_path)
     saved_count = sum(r.get("saved", True) is not False for r in records)
-    excluded_count = sum(r.get("excluded_reason") == "likely_thumbnail" for r in records)
-    log.info("Fichiers réellement sauvegardés : %d | miniatures exclues : %d | formats candidats : %s",
-             saved_count, excluded_count, stats.counts)
-    log.info("Images validées : %d | invalides : %d | réparations créées : %d", valid, invalid, repaired)
-    log.info("Doublons écartés : %d | candidats rejetés : %d", stats.duplicates, stats.rejected)
+    excluded_count = sum(
+        r.get("excluded_reason") == "likely_thumbnail" for r in records
+    )
+    log.info(
+        "Fichiers réellement sauvegardés : %d | miniatures exclues : %d | formats candidats : %s",
+        saved_count,
+        excluded_count,
+        stats.counts,
+    )
+    log.info(
+        "Images validées : %d | invalides : %d | réparations créées : %d",
+        valid,
+        invalid,
+        repaired,
+    )
+    log.info(
+        "Doublons écartés : %d | candidats rejetés : %d",
+        stats.duplicates,
+        stats.rejected,
+    )
     log.info("Durée totale : %.1f s", time.time() - started)
     if not _pillow_available():
-        log.info("Conseil : installe Pillow pour activer validation, réparation et planches-contact : python -m pip install Pillow")
+        log.info(
+            "Conseil : installe Pillow pour activer validation, réparation et planches-contact : python -m pip install Pillow"
+        )
     return 0
 
 
 def _pillow_available() -> bool:
     try:
         import PIL  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -1502,7 +1941,9 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\nInterrompu. Relancez avec --resume pour reprendre là où le scan s'est arrêté.")
+        print(
+            "\nInterrompu. Relancez avec --resume pour reprendre là où le scan s'est arrêté."
+        )
         sys.exit(130)
     except RecupError as exc:
         print(f"\nERREUR : {exc}", file=sys.stderr)
