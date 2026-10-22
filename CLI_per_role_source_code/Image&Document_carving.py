@@ -543,7 +543,8 @@ def classify_jpeg_role(carved_size: int, dims_header: Optional[tuple], exif: dic
     dimensions EXIF pleine taille et les dimensions du flux sont les meilleurs
     indices disponibles sans comparaison visuelle ni analyse du système de fichiers.
     """
-    def positive_int(value):
+    def positive_int(value: object) -> Optional[int]:
+        """Convertit une valeur en entier strictement positif, sinon None."""
         try:
             n = int(value)
             return n if n > 0 else None
@@ -554,14 +555,14 @@ def classify_jpeg_role(carved_size: int, dims_header: Optional[tuple], exif: dic
     full_h = positive_int(exif.get("exif_full_height"))
     w, h = dims_header if dims_header else (None, None)
     w, h = positive_int(w), positive_int(h)
-    valid_dims = bool(w and h)
-    max_dim = max(w, h) if valid_dims else 0
-    pixels = w * h if valid_dims else 0
-    full_pixels = full_w * full_h if full_w and full_h else 0
+    # Vérifier explicitement None permet à Pylance de réduire les types à int.
+    valid_dims = w is not None and h is not None
+    max_dim = max(w, h) if w is not None and h is not None else 0
+    pixels = w * h if w is not None and h is not None else 0
 
     # EXIF donne la taille originale : une différence importante et cohérente
     # constitue l'indice le plus fiable qu'il s'agit d'une vignette intégrée.
-    if full_w and full_h and valid_dims:
+    if full_w is not None and full_h is not None and w is not None and h is not None:
         ratio_w = full_w / max(w, 1)
         ratio_h = full_h / max(h, 1)
         same_aspect = abs((full_w / full_h) - (w / h)) <= 0.08
@@ -1104,8 +1105,13 @@ def main() -> int:
             span = (r["offset_decimal"], r["offset_decimal"] + r["size_bytes"])
             (ranges_strong if is_strong(r) else ranges_weak).append(span)
         if args.exclude_thumbnails:
-            seen_hashes = {r.get("sha256") for r in records
-                           if r.get("sha256") and r.get("saved", True) is not False}
+            seen_hashes = {
+                sha256
+                for r in records
+                if r.get("saved", True) is not False
+                and isinstance((sha256 := r.get("sha256")), str)
+                and sha256
+            }
         for r in records:
             stats.counts[r["type"]] = stats.counts.get(r["type"], 0) + 1
         stats.extracted = sum(r.get("saved", True) is not False for r in records)
@@ -1345,8 +1351,11 @@ def main() -> int:
         unknown_jpegs = sum(r.get("type") == "jpg" and r.get("jpeg_role") == "unknown"
                             for r in photo_records)
         thumbnails_with_valid_original = sum(
-            r.get("type") == "jpg" and r.get("jpeg_role") == "likely_thumbnail"
-            and r.get("has_validated_original_association") for r in photo_records
+            1
+            for r in photo_records
+            if r.get("type") == "jpg"
+            and r.get("jpeg_role") == "likely_thumbnail"
+            and bool(r.get("has_validated_original_association"))
         )
         # Le résumé est le résultat principal de ce mode : il reste visible avec --quiet.
         log.warning("=" * 68)
