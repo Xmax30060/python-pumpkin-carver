@@ -381,31 +381,33 @@ def inspect_volume(drive: str) -> VolumeInfo:
 # Offset-based asynchronous reads
 # ============================================================
 
-class OVERLAPPED(ctypes.Structure):
+class OVERLAPPED(ctypes.Structure):  # pylint: disable=too-few-public-methods
     """Windows OVERLAPPED structure for explicit-offset reads."""
 
     _fields_ = [
-        ("Internal", ctypes.c_size_t),
-        ("InternalHigh", ctypes.c_size_t),
-        ("Offset", wintypes.DWORD),
-        ("OffsetHigh", wintypes.DWORD),
-        ("hEvent", wintypes.HANDLE),
+        ("internal", ctypes.c_size_t),
+        ("internal_high", ctypes.c_size_t),
+        ("offset", wintypes.DWORD),
+        ("offset_high", wintypes.DWORD),
+        ("h_event", wintypes.HANDLE),
     ]
 
 
 def read_at(handle: int, offset: int, size: int) -> bytes:
     """Read exactly one requested chunk at a specific byte offset."""
 
-    overlapped = OVERLAPPED()
-    overlapped.Offset = offset & 0xFFFFFFFF
-    overlapped.OffsetHigh = (offset >> 32) & 0xFFFFFFFF
-
     event = CreateEventW(None, True, False, None)
 
     if not event:
         raise windows_error("Unable to create read event")
 
-    overlapped.hEvent = event
+    overlapped = OVERLAPPED(
+        0,
+        0,
+        offset & 0xFFFFFFFF,
+        (offset >> 32) & 0xFFFFFFFF,
+        event,
+    )
     buffer = ctypes.create_string_buffer(size)
     bytes_read = wintypes.DWORD()
 
@@ -485,15 +487,22 @@ def load_state(paths: ImagePaths) -> ResumeState:
     """Load and validate the saved progress metadata."""
 
     try:
-        payload: dict[str, Any] = json.loads(
+        payload: Any = json.loads(
             paths.state.read_text(encoding="utf-8")
         )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ImagingError(
+            f"Unable to load progress metadata: {exc}"
+        ) from exc
 
-        if payload.get("version") != 1:
-            raise ImagingError("Unsupported progress file version.")
+    if not isinstance(payload, dict):
+        raise ImagingError("Progress metadata must contain a JSON object.")
 
+    if payload.get("version") != 1:
+        raise ImagingError("Unsupported progress file version.")
+
+    try:
         serial = payload.get("serial_number")
-
         state = ResumeState(
             drive=str(payload["drive"]),
             total_bytes=int(payload["total_bytes"]),
@@ -501,12 +510,9 @@ def load_state(paths: ImagePaths) -> ResumeState:
             serial_number=None if serial is None else int(serial),
             completed_bytes=int(payload["completed_bytes"]),
         )
-
-    except ImagingError:
-        raise
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+    except (ValueError, TypeError, KeyError) as exc:
         raise ImagingError(
-            f"Unable to load progress metadata: {exc}"
+            f"Invalid progress metadata fields: {exc}"
         ) from exc
 
     if (
@@ -681,7 +687,7 @@ def image_volume(
                         )
                         break
 
-                    except Exception as exc:
+                    except (OSError, ImagingError, ValueError, ctypes.ArgumentError) as exc:
                         last_error = exc
                         print(
                             f"\nRead error at {format_bytes(completed)} "
