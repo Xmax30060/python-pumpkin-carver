@@ -9,9 +9,16 @@ Parcours intégrés :
   * Extraction depuis une image : carving d'une image disque existante.
 
 Les fichiers récupérés sont rangés par catégorie (Photos, Vidéos, Audio, Documents, Archives).
-La source n'est jamais écrite. Dépendances : flet (requis) ; Pillow, psutil, ffmpeg/ffprobe et Hyperscan facultatifs.
+La source n'est jamais écrite. Dépendances : flet (requis) ; Pillow, psutil, ffmpeg/ffprobe et
+Hyperscan facultatifs.
 Ce logiciel n'est pas un outil forensique certifié pour un usage judiciaire.
 """
+
+# pylint: disable=too-many-lines,unexpected-keyword-arg,too-many-function-args,no-member
+# pylint: disable=unsupported-delete-operation
+# Justification : Flet 1.x génère les contrôles à partir de décorateurs que pylint ne sait
+# pas introspecter, d'où des faux positifs E1121/E1123/E1101/E1138 sur les appels de contrôles.
+# Le module est volontairement regroupé dans un seul fichier (cf. en-tête).
 
 from __future__ import annotations
 
@@ -36,14 +43,33 @@ import tempfile
 import threading
 import time
 import traceback
-from typing import Callable, cast
+from typing import Any, cast
 
 try:
     # Chargement dynamique : Hyperscan reste facultatif et Pylance ne signale pas
     # un import manquant lorsque le paquet n’est pas installé dans cet environnement.
-    _hyperscan = importlib.import_module("hyperscan")
+    _HYPERSCAN = importlib.import_module("hyperscan")
 except (ImportError, OSError):
-    _hyperscan = None
+    _HYPERSCAN = None
+try:
+    import psutil
+except ImportError:  # psutil est facultatif : détection minimale sans lui.
+    psutil = None
+try:
+    from PIL import Image, ImageDraw, ImageFile
+except ImportError:  # Pillow est facultatif : la validation d'image est ignorée.
+    Image = ImageDraw = ImageFile = None
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except ImportError:  # tkinter peut manquer : seul le sélecteur natif est indisponible.
+    tk = filedialog = None
+import ctypes
+
+try:
+    from ctypes import wintypes
+except (ImportError, ValueError, OSError):
+    wintypes = None
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -195,11 +221,13 @@ class PumpkinError(Exception):
 
 
 class ImagingError(PumpkinError):
-    pass
+    """Erreur d'accès ou d'imagerie du support."""
+
 
 
 class CarvingError(PumpkinError):
-    pass
+    """Erreur survenant pendant le carving."""
+
 
 
 def _hidden() -> dict:
@@ -212,6 +240,7 @@ def _hidden() -> dict:
 
 
 def load_config() -> dict:
+    """Fonction utilitaire interne : load_config."""
     try:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -222,6 +251,7 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    """Fonction utilitaire interne : save_config."""
     try:
         CONFIG_FILE.write_text(
             json.dumps(cfg, indent=4, ensure_ascii=False), encoding="utf-8"
@@ -231,6 +261,7 @@ def save_config(cfg: dict) -> None:
 
 
 def format_bytes(value) -> str:
+    """Fonction utilitaire interne : format_bytes."""
     if value is None:
         return "inconnue"
     size = float(value)
@@ -254,15 +285,14 @@ def hardware_profile() -> dict:
     physical = logical
     available_gib = 4.0
     total_gib = None
-    try:
-        import psutil
-
-        physical = max(1, psutil.cpu_count(logical=False) or logical)
-        vm = psutil.virtual_memory()
-        available_gib = max(1.0, vm.available / GIB)
-        total_gib = vm.total / GIB
-    except Exception:
-        pass
+    if psutil is not None:
+        try:
+            physical = max(1, psutil.cpu_count(logical=False) or logical)
+            vm = psutil.virtual_memory()
+            available_gib = max(1.0, vm.available / GIB)
+            total_gib = vm.total / GIB
+        except (OSError, psutil.Error):
+            pass
     # Réserve de la RAM pour Windows, Flet et les caches du système.
     ram_limited_workers = max(1, int(max(1.0, available_gib - 1.0) * 2))
     workers = max(1, min(physical, 32, ram_limited_workers))
@@ -280,6 +310,7 @@ def hardware_profile() -> dict:
 
 
 def default_options() -> dict:
+    """Fonction utilitaire interne : default_options."""
     return {
         "auto_optimize": True,
         "workers": 0,
@@ -370,8 +401,10 @@ def parse_options(raw: dict) -> dict:
     for key, (lo, hi) in bounds.items():
         try:
             v = int(str(raw.get(key, "")).strip())
-        except ValueError:
-            raise PumpkinError(f"« {labels[key]} » doit être un nombre entier.")
+        except ValueError as exc:
+            raise PumpkinError(
+                f"« {labels[key]} » doit être un nombre entier."
+            ) from exc
         if not lo <= v <= hi:
             raise PumpkinError(f"« {labels[key]} » doit être entre {lo} et {hi}.")
         out[key] = v
@@ -393,15 +426,14 @@ def parse_options(raw: dict) -> dict:
 
 
 def safe_name(text: str) -> str:
+    """Fonction utilitaire interne : safe_name."""
     return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_") or "support"
 
 
 def discover_volumes() -> list[dict]:
     """Volumes montés. La taille peut être inconnue : le volume reste sélectionnable."""
     volumes: list[dict] = []
-    try:
-        import psutil
-
+    if psutil is not None:
         for part in psutil.disk_partitions(all=False):
             try:
                 usage = psutil.disk_usage(part.mountpoint)
@@ -420,20 +452,19 @@ def discover_volumes() -> list[dict]:
                     "free": free,
                 }
             )
-    except ImportError:
-        if _WIN:
-            for letter in string.ascii_uppercase:
-                root = f"{letter}:\\"
-                if os.path.exists(root):
-                    volumes.append(
-                        {
-                            "label": root,
-                            "device": root,
-                            "mountpoint": root,
-                            "total": None,
-                            "free": None,
-                        }
-                    )
+    elif _WIN:
+        for letter in string.ascii_uppercase:
+            root = f"{letter}:\\"
+            if os.path.exists(root):
+                volumes.append(
+                    {
+                        "label": root,
+                        "device": root,
+                        "mountpoint": root,
+                        "total": None,
+                        "free": None,
+                    }
+                )
     seen, result = set(), []
     for v in volumes:
         if v["device"] not in seen:
@@ -442,15 +473,13 @@ def discover_volumes() -> list[dict]:
     return result
 
 
+
 # --------------------------------------------------------------------------- #
 # Acquisition d'image (lecture seule, reprise, attente de réinsertion)
 # --------------------------------------------------------------------------- #
 
 
 def _win_api():
-    import ctypes
-    from ctypes import wintypes
-
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateFileW.argtypes = [
         wintypes.LPCWSTR,
@@ -532,10 +561,11 @@ class RawSource:
             except OSError as e:
                 raise ImagingError(
                     f"Impossible d'ouvrir {device} (droits root requis ?) : {e}"
-                )
+                ) from e
             self.size = os.lseek(self._fd, 0, os.SEEK_END)
 
     def read_at(self, offset: int, n: int) -> bytes:
+        """Fonction utilitaire interne : read_at."""
         if _WIN:
             ct = self._ct
             if not self._k32.SetFilePointerEx(self._h, offset, None, 0):
@@ -547,16 +577,14 @@ class RawSource:
             return buf.raw[: got.value]
         if self._fd is None:
             raise OSError("Source de lecture non ouverte.")
-        pread = getattr(os, "pread", None)
-        if callable(pread):
-            # Typage explicite : certaines versions de typeshed exposent pread comme object.
-            pread_fn = cast(Callable[[int, int, int], bytes], pread)
-            return pread_fn(self._fd, n, offset)
+        if hasattr(os, "pread"):
+            return os.pread(self._fd, n, offset)
         # Repli pour les systèmes sans pread (lecture séquentielle uniquement).
         os.lseek(self._fd, offset, os.SEEK_SET)
         return os.read(self._fd, n)
 
     def close(self) -> None:
+        """Fonction utilitaire interne : close."""
         if _WIN and self._h:
             self._k32.CloseHandle(self._h)
             self._h = None
@@ -567,7 +595,7 @@ class RawSource:
                 self._fd = None
 
 
-def _wait_for_device(
+def _wait_for_device(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     device: str, total: int, done: int, log, progress, cancel: threading.Event
 ):
     """Attend la réinsertion du support (gère même un changement de lettre sous Windows)."""
@@ -589,7 +617,7 @@ def _wait_for_device(
             matching = [v for v in volumes if v["total"] == total]
             if matching:
                 target_device = matching[0]["device"]
-        except Exception:
+        except (OSError, ValueError):
             pass
 
         try:
@@ -606,7 +634,7 @@ def _wait_for_device(
     return None
 
 
-def acquire_image(
+def acquire_image(  # pylint: disable=too-many-arguments,too-many-branches,too-many-locals,too-many-positional-arguments,too-many-statements
     device: str,
     image_path: Path,
     log,
@@ -614,6 +642,7 @@ def acquire_image(
     cancel: threading.Event,
     chunk_size: int | None = None,
 ) -> dict:
+    """Copie le support vers un fichier image, avec reprise et attente de réinsertion."""
     acq_chunk = max(MIB, int(chunk_size or CHUNK_ACQ))
     src = RawSource(device)
     try:
@@ -659,7 +688,8 @@ def acquire_image(
 
             save()
 
-            # <-- AJOUT : Forcer l'affichage immédiat de la progression (idéal pour la reprise ou le démarrage)
+            # <-- AJOUT : Forcer l'affichage immédiat de la progression (idéal pour la reprise ou
+            # le démarrage)
             progress(
                 done / total,
                 f"Acquisition : {format_bytes(done)} / {format_bytes(total)}",
@@ -672,14 +702,15 @@ def acquire_image(
                         "status": "cancelled",
                         "done": done,
                         "total": total,
-                        "message": f"Acquisition arrêtée à {format_bytes(done)}. Relancez pour reprendre.",
+                        "message": f"Acquisition arrêtée à {format_bytes(done)}. Relancez pour "
+                        f"reprendre.",
                     }
                 want = min(acq_chunk, total - done)
                 try:
                     data = src.read_at(done, want)
                     if not data:
                         raise OSError("lecture vide (support absent ?)")
-                except Exception as e:
+                except OSError as e:
                     save()
                     log(f"Lecture impossible à {format_bytes(done)} : {e}")
                     src.close()
@@ -690,7 +721,8 @@ def acquire_image(
                             "status": "cancelled",
                             "done": done,
                             "total": total,
-                            "message": f"Acquisition arrêtée à {format_bytes(done)}. Relancez pour reprendre.",
+                            "message": f"Acquisition arrêtée à {format_bytes(done)}. Relancez "
+                            f"pour reprendre.",
                         }
                     src = new
                     continue
@@ -712,19 +744,16 @@ def acquire_image(
 # Carving : scan des signatures (multi-processus, recouvrement correct)
 # --------------------------------------------------------------------------- #
 
-_HS_CACHE_KEY = None
-_HS_CACHE_DB = None
-_HS_CACHE_META = None
+_HS_CACHE: dict[str, Any] = {"module": _HYPERSCAN, "key": None, "db": None, "meta": None}
 
 
 def _hyperscan_matcher(signatures):
     """Compile une base Hyperscan une fois par processus et par ensemble de signatures."""
-    global _HS_CACHE_KEY, _HS_CACHE_DB, _HS_CACHE_META, _hyperscan
-    module = _hyperscan
+    module = _HS_CACHE["module"]
     if module is None:
         return None
     key = tuple(signatures)
-    if _HS_CACHE_KEY != key:
+    if _HS_CACHE["key"] != key:
         expressions = []
         meta = {}
         for ident, (ext, sig, lead) in enumerate(signatures, 1):
@@ -734,19 +763,20 @@ def _hyperscan_matcher(signatures):
         try:
             db = module.Database(mode=module.HS_MODE_BLOCK)
             db.compile(expressions=expressions)
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             # Une version native incompatible ne doit jamais empêcher une récupération.
-            _hyperscan = None
+            _HS_CACHE["module"] = None
             return None
-        _HS_CACHE_KEY, _HS_CACHE_DB, _HS_CACHE_META = key, db, meta
-    if _HS_CACHE_DB is None or _HS_CACHE_META is None:
+        _HS_CACHE.update(key=key, db=db, meta=meta)
+    if _HS_CACHE["db"] is None or _HS_CACHE["meta"] is None:
         return None
-    return _HS_CACHE_DB, _HS_CACHE_META
+    return _HS_CACHE["db"], _HS_CACHE["meta"]
 
 
-def _scan_range(job):
+
+def _scan_range(job):  # pylint: disable=too-many-locals
     """Scanne une plage en une lecture, avec Hyperscan si installé et repli sûr sinon."""
-    path, start, stop, chunk, fsize, signatures, overlap = job
+    path, start, stop, _chunk, fsize, signatures, overlap = job
     read_size = min(fsize - start, (stop - start) + overlap)
     with open(path, "rb", buffering=8 * MIB) as f:
         f.seek(start)
@@ -756,15 +786,15 @@ def _scan_range(job):
     if matcher is not None:
         db, meta = matcher
 
-        def on_match(ident, from_, to, flags, context):
-            ext, sig, lead = meta[ident]
+        def on_match(ident, _from_, to, _flags, _context):
+            ext, sig, lead = meta[ident]  # pylint: disable=unsubscriptable-object
             i = to - len(sig)
             if i < stop - start and start + i - lead >= 0:
                 found.append((start + i - lead, ext))
 
         try:
             db.scan(data, match_event_handler=on_match)
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             found.clear()
             matcher = None
     if matcher is None:
@@ -778,17 +808,17 @@ def _scan_range(job):
     return found
 
 
-def scan_image(
+def scan_image(  # pylint: disable=too-many-arguments,too-many-locals,too-many-positional-arguments
     path: Path,
     workers: int,
     chunk: int,
     progress,
     cancel: threading.Event,
-    log=None,
     exts=None,
 ):
     """Scan CPU optimisé. Le GPU est volontairement désactivé : son chemin expérimental
-    était plus lent/instable sur certaines cartes et ne doit pas ralentir la récupération."""
+    était plus lent/instable sur certaines cartes et ne doit pas ralentir la récupération.
+    """
     size = path.stat().st_size
     if size == 0:
         return [], 0
@@ -871,7 +901,7 @@ def _find_first(f, start, limit, needle, block=4 * MIB):
     return None
 
 
-def _jpeg_length(f, off, size, next_off, eng):
+def _jpeg_length(f, off, size, next_off, eng):  # pylint: disable=too-many-branches,too-many-locals
     limit = min(size, off + MAX_SIZES["jpg"])
     pos = off + 2
     in_scan = False
@@ -994,7 +1024,7 @@ def _zip_length(f, off, size):
     return (p + 22 - off, "fin") if p is not None else None
 
 
-def _measure(f, off, ext, size, next_same, eng):
+def _measure(f, off, ext, size, next_same, eng):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
     if ext == "jpg":
         return _jpeg_length(f, off, size, next_same, eng)
     if ext == "png":
@@ -1020,7 +1050,7 @@ def _measure(f, off, ext, size, next_same, eng):
 # --------------------------------------------------------------------------- #
 
 
-def _base_record(
+def _base_record(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     folder: str, name: str, ext: str, off: int, length: int, digest: str, note: str
 ) -> dict:
     """Construit une entrée de manifeste avec tous les champs attendus par les rapports."""
@@ -1050,11 +1080,9 @@ def _base_record(
     }
 
 
-def _image_checks(record: dict, target: Path, out_dir: Path, opts: dict) -> None:
+def _image_checks(record: dict, target: Path, _out_dir: Path, _opts: dict) -> None:
     """Valide les images si Pillow est disponible, sans rendre Pillow obligatoire."""
-    try:
-        from PIL import Image, ImageFile
-    except ImportError:
+    if Image is None or ImageFile is None:
         record["validation"] = "not_checked"
         record["error"] = "Pillow absent : validation d’image non effectuée."
         return
@@ -1069,7 +1097,7 @@ def _image_checks(record: dict, target: Path, out_dir: Path, opts: dict) -> None
             record["width"], record["height"] = im.size
             im.load()
         record["validation"] = "valid"
-    except Exception as exc:
+    except Exception as exc:  # pylint: disable=broad-exception-caught
         record["validation"] = "invalid"
         record["error"] = f"Validation image : {type(exc).__name__}: {exc}"[:500]
         record["anomaly"] = True
@@ -1107,7 +1135,7 @@ def _probe_video(target: Path) -> dict | None:
         return None
 
 
-def _analyze_video(target: Path, length: int) -> dict:
+def _analyze_video(target: Path, _length: int) -> dict:
     """Analyse prudente des métadonnées vidéo ; n’infère pas de défaut sans preuve."""
     data = _probe_video(target)
     if data is None:
@@ -1243,9 +1271,10 @@ def _copy_region(src_f, off, length, target: Path) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def run_carving(
+def run_carving(  # pylint: disable=too-many-arguments,too-many-branches,too-many-locals,too-many-positional-arguments,too-many-statements
     image, out_dir, opts: dict, log, progress, cancel: threading.Event
 ) -> dict:
+    """Extrait les fichiers d'une image selon les signatures, puis produit les rapports."""
     image = Path(image)
     out_dir = Path(out_dir)
     if not image.is_file():
@@ -1306,16 +1335,18 @@ def run_carving(
         size_before = image.stat().st_size
         started = time.time()
         log(
-            f"Matériel détecté : {profile['physical_cpus']} cœurs physiques, {profile['logical_cpus']} processeurs logiques, "
+            f"Matériel détecté : {profile['physical_cpus']} cœurs physiques, "
+            f"{profile['logical_cpus']} processeurs logiques, "
             f"{profile['available_gib']:.1f} Gio de RAM disponible."
         )
         backend = (
             "Hyperscan natif"
-            if _hyperscan is not None
+            if _HYPERSCAN is not None
             else "recherche intégrée (repli sans dépendance)"
         )
         log(
-            f"Analyse des signatures : {backend}, {workers} processus CPU, blocs de {chunk // MIB} Mio."
+            f"Analyse des signatures : {backend}, {workers} processus CPU, blocs de "
+            f"{chunk // MIB} Mio."
         )
         progress(0.0, "Analyse des signatures…")
         cands, size = scan_image(
@@ -1324,7 +1355,6 @@ def run_carving(
             chunk,
             lambda f, l: progress(0.4 * f, l),
             cancel,
-            log=log,
             exts=exts,
         )
         if cancel.is_set():
@@ -1378,15 +1408,15 @@ def run_carving(
                 encoding="utf-8",
             )
         mf = (
-            open(manifest, "a" if resume else "w", encoding="utf-8")
+            open(manifest, "a" if resume else "w", encoding="utf-8")  # pylint: disable=consider-using-with
             if persist
             else None
         )
         counts: dict[str, int] = {}
         dup = rej = anom = corr = 0
         total = len(cands)
-        src_f = open(image, "rb", buffering=8 * MIB)
-        try:
+        src_f = open(image, "rb", buffering=8 * MIB)  # pylint: disable=consider-using-with
+        try:  # pylint: disable=too-many-nested-blocks
             for idx, (off, ext) in enumerate(cands, 1):
                 if cancel.is_set():
                     log("Arrêt demandé par l'utilisateur.")
@@ -1497,13 +1527,15 @@ def run_carving(
             return {
                 "status": "done",
                 "stats": stats,
-                "message": f"Simulation : {total} candidat(s), par type {counts}. Aucun fichier écrit.",
+                "message": f"Simulation : {total} candidat(s), par type {counts}. Aucun fichier "
+                f"écrit.",
             }
         if analyze:
             return {
                 "status": "done",
                 "stats": stats,
-                "message": f"Analyse seule : {total} candidat(s), {stats['valid']} photo(s) valide(s), "
+                "message": f"Analyse seule : {total} candidat(s), {stats['valid']} photo(s) "
+                f"valide(s), "
                 f"{anom} anomalie(s) vidéo. Aucun fichier conservé.",
             }
         csv_path, html_path = _write_reports(
@@ -1524,10 +1556,8 @@ def run_carving(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _contact_sheet(records, out_dir: Path) -> list[str]:
-    try:
-        from PIL import Image, ImageDraw
-    except ImportError:
+def _contact_sheet(records, out_dir: Path) -> list[str]:  # pylint: disable=too-many-locals
+    if Image is None or ImageDraw is None:
         return []
     paths = [
         out_dir / r["folder"] / r["file"]
@@ -1554,7 +1584,7 @@ def _contact_sheet(records, out_dir: Path) -> list[str]:
                     p.name[:28],
                     fill=(20, 20, 20),
                 )
-            except Exception:
+            except (OSError, ValueError):
                 continue
         name = f"planche_contact_{n:03d}.jpg"
         sheet.save(out_dir / "Photos" / name, quality=85)
@@ -1562,7 +1592,7 @@ def _contact_sheet(records, out_dir: Path) -> list[str]:
     return outputs
 
 
-def _write_reports(
+def _write_reports(  # pylint: disable=too-many-arguments,too-many-locals,too-many-positional-arguments
     records, out_dir: Path, image: Path, size: int, stats: dict, opts: dict
 ):
     csv_path = out_dir / "rapport_recuperation.csv"
@@ -1591,16 +1621,21 @@ def _write_reports(
         "anomaly_reason",
     )
     html_path = out_dir / "rapport_recuperation.html"
-    # Écriture progressive : évite de dupliquer tout le rapport en mémoire pour des millions de candidats.
+    # Écriture progressive : évite de dupliquer tout le rapport en mémoire pour des millions de
+    # candidats.
     with open(html_path, "w", encoding="utf-8", buffering=1024 * 1024) as report:
         report.write(
-            "<!doctype html><html lang='fr'><meta charset='utf-8'><title>Rapport de récupération</title>"
-            "<style>body{font:14px sans-serif;margin:24px}table{border-collapse:collapse;width:100%}"
+            "<!doctype html><html lang='fr'><meta charset='utf-8'><title>Rapport de "
+            "récupération</title>"
+            "<style>body{font:14px "
+            "sans-serif;margin:24px}table{border-collapse:collapse;width:100%}"
             "th,td{border:1px solid #ccc;padding:6px;text-align:left}th{background:#eee}</style>"
             "<h1>Rapport de récupération</h1>"
             f"<p>Source : {esc(image)}</p>"
-            f"<p>Candidats : {stats['candidates']} ; enregistrés : {stats['saved']} ; valides : {stats['valid']} ; "
-            f"invalides : {stats['invalid']} ; réparations : {stats['repaired']} ; doublons : {stats['duplicates']} ; "
+            f"<p>Candidats : {stats['candidates']} ; enregistrés : {stats['saved']} ; valides : "
+            f"{stats['valid']} ; "
+            f"invalides : {stats['invalid']} ; réparations : {stats['repaired']} ; doublons : "
+            f"{stats['duplicates']} ; "
             f"rejetés : {stats['rejected']} ; anomalies vidéo : {stats['anomalies']}</p>"
         )
         if sheets:
@@ -1645,6 +1680,7 @@ def _write_reports(
 
 
 def run_workflow(cfg: dict, log, progress, cancel: threading.Event) -> dict:
+    """Exécute le parcours choisi : acquisition, carving ou les deux."""
     preset = cfg["preset"]
     out_dir = Path(cfg["output_dir"])
     opts = {**cfg["options"], "exts": cfg.get("exts") or sorted(ALL_EXTS)}
@@ -1700,6 +1736,7 @@ def run_workflow(cfg: dict, log, progress, cancel: threading.Event) -> dict:
 
 
 def native_pick(kind: str, title: str, initial: str):
+    """Ouvre un sélecteur de fichier ou de dossier natif dans un sous-processus."""
     try:
         proc = subprocess.run(
             [
@@ -1714,10 +1751,11 @@ def native_pick(kind: str, title: str, initial: str):
             text=True,
             encoding="utf-8",
             timeout=900,
+            check=False,
             **_hidden(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
-        raise PumpkinError(f"Sélecteur indisponible : {e}")
+        raise PumpkinError(f"Sélecteur indisponible : {e}") from e
     if proc.returncode != 0:
         raise PumpkinError("Sélecteur indisponible (tkinter absent ?).")
     return proc.stdout.strip() or None
@@ -1729,8 +1767,8 @@ def _native_picker(argv) -> None:
     p.add_argument("title")
     p.add_argument("initial")
     a = p.parse_args(argv)
-    import tkinter as tk
-    from tkinter import filedialog
+    if tk is None or filedialog is None:
+        sys.exit(2)
 
     root = tk.Tk()
     root.withdraw()
@@ -1763,7 +1801,8 @@ def _native_picker(argv) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def main(page: ft.Page):
+def main(page: ft.Page):  # pylint: disable=too-many-locals,too-many-statements
+    """Point d'entrée de l'interface Flet : affiche les écrans et lance les traitements."""
     config = load_config()
     page.title = f"{APP_NAME} - Accueil"
     page.padding = 24
@@ -1777,7 +1816,7 @@ def main(page: ft.Page):
     page.window.min_width = 760
     page.window.min_height = 650
 
-    state = {
+    state: dict[str, Any] = {
         "preset": None,
         "step": 0,
         "media_type": None,
@@ -1816,9 +1855,9 @@ def main(page: ft.Page):
             padding=18,
             border=ft.Border(top=side, right=side, bottom=side, left=side),
             border_radius=16,
-            bgcolor=ft.Colors.with_opacity(0.08, ft.Colors.ORANGE)
-            if selected
-            else None,
+            bgcolor=(
+                ft.Colors.with_opacity(0.08, ft.Colors.ORANGE) if selected else None
+            ),
             animate=ft.Animation(220, ft.AnimationCurve.EASE_OUT),
             on_click=on_click,
         )
@@ -1914,32 +1953,38 @@ def main(page: ft.Page):
             ),
             (
                 "Choisir un mode",
-                "Full Carving acquiert le support puis récupère les fichiers. Setup Carving crée seulement "
+                "Full Carving acquiert le support puis récupère les fichiers. Setup Carving crée "
+                "seulement "
                 "une image. Extraction depuis une image travaille sur un fichier image existant.",
             ),
             (
                 "Choisir le support",
-                "Choisissez le volume détecté. Sous Windows, lancez l'application en administrateur.",
+                "Choisissez le volume détecté. Sous Windows, lancez l'application en "
+                "administrateur.",
             ),
             (
                 "Choisir les types",
-                "Les fichiers sont rangés par catégorie : Photos, Vidéos, Audio, Documents, Archives.",
+                "Les fichiers sont rangés par catégorie : Photos, Vidéos, Audio, Documents, "
+                "Archives.",
             ),
             (
                 "Paramètres avancés",
-                "L'avant-dernière étape règle les threads d'analyse, les blocs, les filtres et les modes "
+                "L'avant-dernière étape règle les threads d'analyse, les blocs, les filtres et "
+                "les modes "
                 "simulation ou analyse seule. Les valeurs par défaut conviennent en général.",
             ),
             (
                 "Interruptions",
-                "Si le support se déconnecte, l'application attend sa réinsertion puis reprend là où elle "
-                "s'était arrêtée. Une récupération interrompue reprend automatiquement dans son dossier.",
+                "Si le support se déconnecte, l'application attend sa réinsertion puis reprend "
+                "là où elle "
+                "s'était arrêtée. Une récupération interrompue reprend automatiquement dans son "
+                "dossier.",
             ),
         ]
         index = {"value": 0}
         title = ft.Text(steps[0][0], size=24, weight=ft.FontWeight.BOLD)
         body = ft.Text(steps[0][1], size=16)
-        bar = ft.ProgressBar(value=1 / len(steps), color=ft.Colors.ORANGE)
+        progress_bar = ft.ProgressBar(value=1 / len(steps), color=ft.Colors.ORANGE)
         counter = ft.Text(f"Étape 1 sur {len(steps)}", color=ft.Colors.OUTLINE)
         next_button = ft.Button(
             "Étape suivante",
@@ -1952,7 +1997,7 @@ def main(page: ft.Page):
                 index["value"] += 1
                 i = index["value"]
                 title.value, body.value = steps[i]
-                bar.value = (i + 1) / len(steps)
+                progress_bar.value = (i + 1) / len(steps)
                 counter.value = f"Étape {i + 1} sur {len(steps)}"
                 next_button.content = (
                     "Terminer" if i == len(steps) - 1 else "Étape suivante"
@@ -1965,7 +2010,7 @@ def main(page: ft.Page):
             "Tutoriel",
             [
                 app_header("Tutoriel"),
-                outlined_card(ft.Column([counter, bar, title, body], spacing=18)),
+                outlined_card(ft.Column([counter, progress_bar, title, body], spacing=18)),
                 ft.Row(
                     [
                         ft.TextButton(
@@ -2095,7 +2140,7 @@ def main(page: ft.Page):
             options=[ft.dropdown.Option("fr", "Français")],
         )
 
-        def save_settings(e):
+        def save_settings(_e):
             config["username"] = (username.value or "").strip() or "Utilisateur"
             config["theme"] = theme.value or "dark"
             config["langue"] = language.value or "fr"
@@ -2146,7 +2191,7 @@ def main(page: ft.Page):
 
     # ----- Assistant ---------------------------------------------------------
 
-    LABELS = {
+    preset_labels = {
         "full": "Full Carving",
         "setup": "Setup Carving",
         "image_only": "Extraction depuis une image",
@@ -2161,19 +2206,19 @@ def main(page: ft.Page):
 
     def show_wizard():
         preset = state["preset"]
-        title = LABELS.get(preset, "Configuration")
+        title = preset_labels.get(preset, "Configuration")
         steps = get_steps(preset)
         state["step"] = max(0, min(state["step"], len(steps) - 1))
         step = state["step"]
 
-        def previous(e):
+        def previous(_e):
             if state["step"] > 0:
                 state["step"] -= 1
                 show_wizard()
             else:
                 show_dashboard()
 
-        def next_step(e):
+        def next_step(_e):
             if not validate_step(steps[state["step"]]):
                 return
             if state["step"] < len(steps) - 1:
@@ -2204,9 +2249,11 @@ def main(page: ft.Page):
                             "Précédent", icon=ft.Icons.ARROW_BACK, on_click=previous
                         ),
                         ft.Button(
-                            "Étape suivante"
-                            if step < len(steps) - 1
-                            else "Vérifier la configuration",
+                            (
+                                "Étape suivante"
+                                if step < len(steps) - 1
+                                else "Vérifier la configuration"
+                            ),
                             icon=ft.Icons.ARROW_FORWARD,
                             on_click=next_step,
                         ),
@@ -2226,11 +2273,11 @@ def main(page: ft.Page):
         if not v:
             return "Aucun volume sélectionné."
         return (
-            f"Périphérique : {v['device']}\nPoint de montage : {v['mountpoint']}\n"
-            f"Capacité détectée : {format_bytes(v['total'])}"
+            f"Périphérique : {v['device']}\nPoint de montage : {v['mountpoint']}\n"  # pylint: disable=unsubscriptable-object
+            f"Capacité détectée : {format_bytes(v['total'])}"  # pylint: disable=unsubscriptable-object
         )
 
-    def build_step(step_name):
+    def build_step(step_name):  # pylint: disable=too-many-return-statements
         if step_name == "media":
 
             def pick(kind):
@@ -2311,7 +2358,7 @@ def main(page: ft.Page):
                 (
                     str(i)
                     for i, v in enumerate(volumes)
-                    if current and v["device"] == current["device"]
+                    if current and v["device"] == current["device"]  # pylint: disable=unsubscriptable-object
                 ),
                 None,
             )
@@ -2331,7 +2378,8 @@ def main(page: ft.Page):
                         weight=ft.FontWeight.BOLD,
                     ),
                     ft.Text(
-                        "Un volume sans taille lisible reste utilisable : la taille sera lue sur le support.",
+                        "Un volume sans taille lisible reste utilisable : la taille sera lue sur "
+                        "le support.",
                         color=ft.Colors.OUTLINE,
                     ),
                     ft.Dropdown(
@@ -2438,7 +2486,8 @@ def main(page: ft.Page):
                         weight=ft.FontWeight.BOLD,
                     ),
                     ft.Text(
-                        "Les fichiers seront rangés dans des sous-dossiers Photos, Vidéos, Audio, Documents, Archives.",
+                        "Les fichiers seront rangés dans des sous-dossiers Photos, Vidéos, "
+                        "Audio, Documents, Archives.",
                         color=ft.Colors.OUTLINE,
                     ),
                     ft.Text(state["output_dir"], selectable=True),
@@ -2466,7 +2515,8 @@ def main(page: ft.Page):
             if value < 34:
                 return (
                     "Récupération maximale",
-                    "Recherche prudente : conserve les petits fichiers et les doublons, tente le sauvetage JPEG. Plus lent, sans garantie absolue de tout retrouver.",
+                    "Recherche prudente : conserve les petits fichiers et les doublons, tente le "
+                    "sauvetage JPEG. Plus lent, sans garantie absolue de tout retrouver.",
                 )
             if value < 67:
                 return (
@@ -2475,7 +2525,8 @@ def main(page: ft.Page):
                 )
             return (
                 "Rapide",
-                "Traitement accéléré : certains petits fichiers, miniatures ou fichiers tronqués peuvent être ignorés.",
+                "Traitement accéléré : certains petits fichiers, miniatures ou fichiers tronqués "
+                "peuvent être ignorés.",
             )
 
         initial_name, initial_desc = describe_profile(profile_value)
@@ -2491,7 +2542,7 @@ def main(page: ft.Page):
             profile_status.value = f"Profil sélectionné : {name} — {desc}"
             page.update()
 
-        def apply_profile(e):
+        def apply_profile(_e):
             state["options"] = apply_recovery_profile(
                 state["options"], pending_profile["value"]
             )
@@ -2526,7 +2577,8 @@ def main(page: ft.Page):
             [
                 ft.Text("Paramètres avancés", size=20, weight=ft.FontWeight.BOLD),
                 ft.Text(
-                    "Choisissez un compromis : le curseur préremplit les paramètres ci-dessous. Vous pouvez ensuite les modifier manuellement.",
+                    "Choisissez un compromis : le curseur préremplit les paramètres ci-dessous. "
+                    "Vous pouvez ensuite les modifier manuellement.",
                     color=ft.Colors.OUTLINE,
                 ),
                 ft.Text("Niveau de récupération", weight=ft.FontWeight.BOLD),
@@ -2555,7 +2607,9 @@ def main(page: ft.Page):
                     wrap=True,
                 ),
                 ft.Text(
-                    "Le moteur CPU multi-processus ajuste le parallélisme aux ressources disponibles. Le scan évite les transferts GPU et limite les lectures et copies inutiles.",
+                    "Le moteur CPU multi-processus ajuste le parallélisme aux ressources "
+                    "disponibles. Le scan évite les transferts GPU et limite les lectures et "
+                    "copies inutiles.",
                     size=12,
                     color=ft.Colors.OUTLINE,
                 ),
@@ -2663,7 +2717,7 @@ def main(page: ft.Page):
             state["extensions"].difference_update(exts)
         show_wizard()
 
-    def pick_image(e):
+    def pick_image(_e):
         try:
             path = native_pick(
                 "file", "Pumpkin Carver - Sélectionner une image disque", str(BASE_DIR)
@@ -2678,14 +2732,16 @@ def main(page: ft.Page):
         state["image_path"] = path
         show_wizard()
 
-    def pick_output(e):
+    def pick_output(_e):
         try:
             path = native_pick(
                 "dir",
                 "Pumpkin Carver - Choisir le dossier de sortie",
-                state["output_dir"]
-                if os.path.isdir(state["output_dir"])
-                else str(BASE_DIR),
+                (
+                    state["output_dir"]
+                    if os.path.isdir(state["output_dir"])
+                    else str(BASE_DIR)
+                ),
             )
         except PumpkinError as ex:
             notify(str(ex))
@@ -2713,7 +2769,7 @@ def main(page: ft.Page):
         except OSError:
             return []
 
-    def validate_step(step_name):
+    def validate_step(step_name):  # pylint: disable=too-many-return-statements
         if step_name == "media" and not state["media_type"]:
             notify("Sélectionnez Carte SD ou Clé USB.")
             return False
@@ -2753,17 +2809,18 @@ def main(page: ft.Page):
     def show_summary(preset):
         rows = [
             ft.Text("Vérifiez votre configuration", size=24, weight=ft.FontWeight.BOLD),
-            ft.Text(f"Mode : {LABELS[preset]}"),
+            ft.Text(f"Mode : {preset_labels[preset]}"),
         ]
         if preset in ("full", "setup"):
             rows += [
                 ft.Text(f"Support : {media_label()}"),
                 ft.Text(
-                    f"Volume : {state['volume']['label'] if state['volume'] else '—'}",
+                    f"Volume : {state['volume']['label'] if state['volume'] else '—'}",  # pylint: disable=unsubscriptable-object
                     selectable=True,
                 ),
                 ft.Text(
-                    f"Taille : {format_bytes(state['volume']['total']) if state['volume'] else 'inconnue'}"
+                    f"Taille : "
+                    f"{format_bytes(state['volume']['total']) if state['volume'] else 'inconnue'}"  # pylint: disable=unsubscriptable-object
                 ),
             ]
         else:
@@ -2783,7 +2840,8 @@ def main(page: ft.Page):
         perf_label = (
             "Automatique"
             if state["options"].get("auto_optimize", True)
-            else f"{state['options']['workers']} processus / blocs {state['options']['chunk_mib']} Mio"
+            else f"{state['options']['workers']} processus / blocs "
+            f"{state['options']['chunk_mib']} Mio"
         )
         gpu_label = "CPU multi-processus optimisé"
         rows.append(
@@ -2797,7 +2855,7 @@ def main(page: ft.Page):
             value=False,
         )
 
-        def launch(e):
+        def launch(_e):
             if preset != "image_only" and not confirm.value:
                 notify("Cochez la confirmation avant de lancer.")
                 return
@@ -2807,12 +2865,12 @@ def main(page: ft.Page):
                 notify(str(ex))
                 return
             show_run(
-                LABELS[preset],
+                preset_labels[preset],
                 lambda log, prog, cancel: run_workflow(cfg, log, prog, cancel),
             )
 
         show_view(
-            LABELS[preset],
+            preset_labels[preset],
             [
                 app_header("Résumé"),
                 outlined_card(
@@ -2841,7 +2899,7 @@ def main(page: ft.Page):
 
     # ----- Exécution et résultats -------------------------------------------
 
-    def show_run(title, runner):
+    def show_run(title, runner):  # pylint: disable=too-many-locals,too-many-statements
         cancel_event = threading.Event()
         events: queue.Queue[tuple[str, object]] = queue.Queue()
         # La progression est une valeur d'état, pas un événement à conserver à chaque
@@ -2849,11 +2907,11 @@ def main(page: ft.Page):
         progress_lock = threading.Lock()
         latest_progress: list[tuple[float | None, str] | None] = [None]
         status = ft.Text("Préparation…", selectable=True)
-        bar = ft.ProgressBar(value=None, color=ft.Colors.ORANGE)
+        progress_bar = ft.ProgressBar(value=None, color=ft.Colors.ORANGE)
         log_view = ft.ListView(expand=True, spacing=2, auto_scroll=True, height=220)
         results_holder = ft.Column(spacing=8)
 
-        def request_cancel(e):
+        def request_cancel(_e):
             cancel_event.set()
             status.value = "Annulation demandée…"
             page.update()
@@ -2884,14 +2942,14 @@ def main(page: ft.Page):
             except PumpkinError as ex:
                 events.put(("error", f"Erreur : {ex}"))
                 log(f"ERREUR : {ex}")
-            except Exception as ex:
+            except Exception as ex:  # pylint: disable=broad-exception-caught
                 events.put(("error", f"Erreur inattendue : {ex}"))
                 log(f"ERREUR INATTENDUE : {ex}")
                 log(traceback.format_exc()[-800:])
             finally:
                 events.put(("worker_done", None))
 
-        async def pump_ui():
+        async def pump_ui():  # pylint: disable=too-many-branches
             worker_finished = False
             while True:
                 changed = False
@@ -2912,7 +2970,7 @@ def main(page: ft.Page):
                         summary = payload if isinstance(payload, dict) else {}
                         status.value = summary.get("message", "Terminé.")
                         if summary.get("status") == "done":
-                            bar.value = 1
+                            progress_bar.value = 1
                         if summary.get("csv"):
                             results_holder.controls.extend(
                                 results_block(summary["csv"])
@@ -2936,13 +2994,13 @@ def main(page: ft.Page):
                     frac, label = progress_update
                     status.value = label
                     if frac is not None:
-                        bar.value = max(0.0, min(1.0, frac))
+                        progress_bar.value = max(0.0, min(1.0, frac))
                     changed = True
 
                 if changed:
                     try:
                         page.update()
-                    except Exception as ex:
+                    except Exception as ex:  # pylint: disable=broad-exception-caught
                         print(
                             f"[interface] mise à jour impossible : {ex}",
                             file=sys.stderr,
@@ -2962,7 +3020,7 @@ def main(page: ft.Page):
                     [ft.ProgressRing(width=18, height=18, stroke_width=2), status],
                     spacing=12,
                 ),
-                bar,
+                progress_bar,
                 ft.Row([cancel_btn, back_btn]),
                 ft.Text("Journal", weight=ft.FontWeight.BOLD),
                 log_view,
@@ -3034,7 +3092,7 @@ def main(page: ft.Page):
             render()
             listing.update()
 
-        def on_reverse(e):
+        def on_reverse(_e):
             sort["reverse"] = not sort["reverse"]
             render()
             listing.update()
